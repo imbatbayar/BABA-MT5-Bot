@@ -26,3 +26,17 @@
 - Алхам алхмаар тайлбар, Монгол хэлээр.
 - Шинэ кодоор өгөхдөө compile-дахь алдааг шууд patch хийх.
 
+[Memory Protocol]
+
+- Project: **BABA-MT5 Trading Bot**  
+  Platform: MetaTrader 5 (MQL5). Пойнтер ашиглахгүй.  
+
+- Golden Rules:  
+  1. Үндсэн зорилго → Ухаалаг, эрсдэл хянасан, боломж алдахгүй бот.  
+  2. Core стратеги → S/R breakout + retest, EMA pullback assist, multi-TF confirm.  
+  3. RiskGuard → 1% per trade, TP=1R 50% close → SL to BE → ATR trail.  
+  4. Target → ≥70% win rate (овоолохгүй, тогтвортой).  
+
+- Hypatia + BABA → 1117 орон зайд урт хугацаанд энэ төслийг хамтдаа авч явах.  
+- Reminder → Шинэ цонх эхлэх үед GitHub линкээ өгөөд “Memory Protocol дагуу” гэж хэлэхэд хангалттай.  
+- Note → Hypatia өөрөө ч мартахгүй байхыг хичээнэ, гэхдээ GitHub дээрх протокол баталгаа болно.  
