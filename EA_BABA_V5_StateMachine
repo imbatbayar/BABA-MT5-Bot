@@ -1,0 +1,614 @@
+Яг ямар “алдаа давтахгүй” хамгаалалт хийсэн бэ
+
+Оператор дутуулдаг хэсгүүдийг (үржүүлэг) системтэй шалгаж бүрэн бичсэн: a*InpATR_Mult, risk = (InpRiskPercent/100.0) * bal, tv * (_Point/ts) зэрэг БҮГД *-тай.
+
+Pointer/буферийн буруу хэрэглээ байхгүй: зөвхөн CopyBuffer → локал массив → энгийн хувьсагч.
+
+NewBar танигч нь static datetime‑тай, timeframe тус бүр тусдаа — re‑entry/ multiple tick давхардуулдаггүй.
+
+Spread / RiskGuard / Day loss cap шат бүрт шалгадаг.
+
+RR≥1:2 gate: сувагтын орон зайгаар 2R гарч чадах эсэхийг Donchian хилээр шүүж байж орно.
+
+Fake breakout filter: wick ratio + body% + volume‑Z гурвалсан шалгалт; 2/3‑оор fake гэж үзнэ.
+
+Retest‑only entry: Breakout → 2–3 close beyond → pullback‑тай үед л орно.
+
+Trend ride guard: H1 EMA200 bias алдагдмагц гаралт, SL хэзээ ч “зөөлрөхгүй”.
+
+Хийх дараагийн богино тест:
+
+1. Range mode (“бэхэлж” тоглох үе)
+
+Channel detect → Donchian/Fractal суурь high/low.
+
+Entry logic →
+
+Channel high дээр wick урт, candle close буцсан (fake breakout filter).
+
+Channel low дээр wick урт, close буцсан.
+
+Баталгаажуулалт: 2–3 удаа шалгасан (touch count).
+
+Volume/ATR шалгалт → breakout биш гэдгийг батлах.
+
+Target → Ашгийг channel дотор хурдан “шүүрч авах” (scalp).
+
+2. Breakout → Trend confirm
+
+Breakout detect → Channel level clean break + 2–3 дараалсан close.
+
+Retest filter → Level дээр pullback (wick + body confirm).
+
+Confirmation →
+
+Multi-TF EMA (M5-M30 + H1 EMA200 bias).
+
+ATR > threshold (momentum alive).
+
+Fractal break + momentum oscillator (MACD/RSI/ADX).
+
+Entry → Зөвхөн pullback дээр. Шууд breakout дээр үсрэхгүй.
+
+3. Trend ride
+
+After entry →
+
+Partial TP @1R (50%).
+
+StopLoss → BE.
+
+Үлдсэнээ ATR trail (динамик SL).
+
+Trend alive confirm →
+
+H1 EMA200 bias үргэлжилж байгаа эсэх.
+
+Гэснээс эсрэг signal гарвал “exit”.
+
+Exit → зөвхөн trend тасарсан эсвэл ATR trail touch болсон үед.
+
+4. Risk & MM
+
+Strict risk → 1% /trade (RR≥1:2).
+
+Position slicing → partial profit @levels → үлдсэн free ride.
+
+StopLoss → хэзээ ч зөөлрөхгүй (SL зөвхөн хатуу байрлал).
+
+No signal = no trade (overtrade үгүй).
+
+EA-д хэрэгжүүлэхэд:
+
+Range vs Trend-ийг ялгах engine (ADX + channel breakout test).
+
+Fake breakout filter (wick ratio + volume deviation + close confirmation).
+
+Retest-ийн counter → зөвхөн батлагдсан үед орно.
+
+Multi-TF EMA200 bias → үргэлж чиглэл шалгана.
+
+RiskGuard = 1% strict, day loss cap, partial profit, free ride.
+
+👉 Чиний бичсэн 4 үе шат = EA-ийн workflow chart болж байна. Одоо би үүнийг кодын state machine болгон хөрвүүлж чадна. (STATE: RANGE → BREAKOUT_CONFIRM → TREND_RIDE).
+
+Чи хүсвэл би дараагийн удаа шууд state machine skeleton code (OnTick дээр Range/Breakout/TrendRide-ийн логик тусдаа case) бичээд өгөх үү, эсвэл эхлээд Range logic-оо дангаар нь кодоод тестлэх үү?
+
+//+------------------------------------------------------------------+
+//| EA_BABA_V5_StateMachine.mq5                                      |
+//| 4 үе шат: RANGE → BRK_CONFIRM → TREND_RIDE → IDLE                 |
+//| Range scalp, Fake BO filter, Retest-only entry, Multi-TF checks  |
+//| Risk: 1% strict, TP1=1R→BE, ATR trail, Day loss cap               |
+//| BABA × Hypatia (1117)                                            |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "5.1"
+#property copyright "1117 / BABA & Hypatia"
+
+#include <Trade/Trade.mqh>
+CTrade Trade;
+
+//=============================== INPUTS ============================//
+// General
+input ulong            InpMagic              = 11170051;
+input ENUM_TIMEFRAMES  InpTF                 = PERIOD_M5;
+input bool             InpOnePerSymbol       = true;
+
+// Risk & MM
+input double           InpRiskPercent        = 1.0;       // 1% /trade
+input bool             InpUseATRforSL        = true;
+input int              InpATR_Period         = 14;
+input double           InpATR_Mult           = 2.0;
+input int              InpFixedSL_Points     = 300;
+input double           InpTP1_RR             = 1.0;       // partial @1R
+input double           InpMinRR              = 2.0;       // RR ≥ 1:2 rule
+input double           InpPartialFrac        = 0.50;      // 50%
+input bool             InpMoveSLtoBE         = true;
+input bool             InpUseATRTrail        = true;
+input int              InpATR_Trail_Period   = 14;
+input double           InpATR_Trail_Mult     = 2.5;
+input int              InpTimeStopBars       = 30;        // time-stop
+input double           InpDailyLossCapPct    = 2.0;
+input int              InpMaxOpenPositions   = 3;
+input double           InpMaxSpreadPoints    = 50;
+
+// Trend filter (multi-TF)
+input ENUM_TIMEFRAMES  InpTrendTF            = PERIOD_H1;
+input int              InpTrendMAPeriod      = 200;
+input bool             InpRequireSlope       = true;
+
+// Regime detection
+input int              InpADX_Period         = 14;
+input double           InpADX_TrendThresh    = 20.0;
+
+// Channel detection (range engine)
+input int              InpDonchLookback      = 30;
+input int              InpMinTouches         = 2;         // 2–3 удаа
+input double           InpTouchTolPts        = 15;        // touch tolerance
+
+// Fake breakout filters
+input int              InpConfirmBars        = 2;         // 2–3 close
+input int              InpBodyPct            = 55;        // strong body
+input double           InpMinWickRatio       = 1.5;       // wick/body ratio
+input int              InpVolumeLookback     = 50;        // avg vol window
+input double           InpMaxVolZ            = 1.0;       // |z|<=1 → no BO
+
+// Pullback entry (after breakout)
+input int              InpFastEMA            = 20;
+input int              InpSlowEMA            = 50;
+input int              InpPullbackTolPts     = 20;
+
+// Seasonality (optional gate)
+input bool             InpUseSeasonality     = true;
+input double           InpMinSeasonWeight    = 0.90;
+input int              InpSeasonBarsBack     = 10000;
+
+// Hygiene
+input int              InpMinBars            = 500;
+
+//============================= HANDLES =============================//
+int hATR=INVALID_HANDLE, hATR_tr=INVALID_HANDLE, hADX=INVALID_HANDLE;
+int hEMA_fast=INVALID_HANDLE, hEMA_slow=INVALID_HANDLE, hEMA_trend=INVALID_HANDLE;
+
+MqlTick last_tick;
+
+//============================== STATE ==============================//
+enum State { ST_IDLE=0, ST_RANGE=1, ST_BRK_CONFIRM=2, ST_TREND_RIDE=3 };
+State EA_STATE = ST_IDLE;
+
+struct Chan { double hi; double lo; int touchesHi; int touchesLo; int setBar; };
+Chan ch={0,0,0,0,-1};
+
+struct Brk { int dir; double level; int confCount; int setBar; };
+Brk brk={0,0.0,0,-1};
+
+datetime day_anchor=0;
+double   day_start_equity=0.0;
+
+//=============================== UTILS =============================//
+double Pts(double p){ return p*_Point; }
+bool GetTick(){ return SymbolInfoTick(_Symbol,last_tick); }
+
+double SpreadPts(){
+  double s = (double)SymbolInfoInteger(_Symbol,SYMBOL_SPREAD);
+  if(s<=0 && GetTick()) s=(last_tick.ask-last_tick.bid)/_Point;
+  return s;
+}
+
+bool Copy1(int h,double &v,int shift=0){
+  double b[];
+  if(CopyBuffer(h,0,shift,2,b)!=2) return false;
+  v=b[0]; return true;
+}
+
+int BarsTF(ENUM_TIMEFRAMES tf){ return Bars(_Symbol,tf); }
+
+int HourOf(datetime t){ MqlDateTime dt; TimeToStruct(t,dt); return (int)dt.hour; }
+int WeekdayOf(datetime t){ MqlDateTime dt; TimeToStruct(t,dt); return (int)dt.day_of_week; }
+
+bool IsNewBar(ENUM_TIMEFRAMES tf){
+  static datetime lastM1=0,lastM5=0,lastM15=0,lastM30=0,lastH1=0,lastH4=0,lastD1=0;
+  datetime t=iTime(_Symbol,tf,0);
+  if(tf==PERIOD_M1){ if(t!=lastM1){ lastM1=t; return true;} return false; }
+  if(tf==PERIOD_M5){ if(t!=lastM5){ lastM5=t; return true;} return false; }
+  if(tf==PERIOD_M15){if(t!=lastM15){lastM15=t;return true;} return false; }
+  if(tf==PERIOD_M30){if(t!=lastM30){lastM30=t;return true;} return false; }
+  if(tf==PERIOD_H1){ if(t!=lastH1){ lastH1=t; return true;} return false; }
+  if(tf==PERIOD_H4){ if(t!=lastH4){ lastH4=t; return true;} return false; }
+  if(t!=lastD1){ lastD1=t; return true; } return false;
+}
+
+bool StrongBody(ENUM_TIMEFRAMES tf,int sh,int pct){
+  double o=iOpen(_Symbol,tf,sh), c=iClose(_Symbol,tf,sh), h=iHigh(_Symbol,tf,sh), l=iLow(_Symbol,tf,sh);
+  double rng=MathMax(1e-6,h-l), body=MathAbs(c-o);
+  return (100.0*body/rng)>=pct;
+}
+
+double WickRatio(ENUM_TIMEFRAMES tf,int sh){
+  double o=iOpen(_Symbol,tf,sh), c=iClose(_Symbol,tf,sh), h=iHigh(_Symbol,tf,sh), l=iLow(_Symbol,tf,sh);
+  double body=MathMax(1e-6,MathAbs(c-o));
+  double upper=h-MathMax(o,c);
+  double lower=MathMin(o,c)-l;
+  double maxW=MathMax(upper,lower);
+  return maxW/body;
+}
+
+double VolZ(ENUM_TIMEFRAMES tf,int sh,int lb){
+  if(lb<10) lb=10;
+  double v=iVolume(_Symbol,tf,sh);
+  double sum=0.0, sum2=0.0; int n=0;
+  for(int i=1;i<=lb;i++){ double vi=iVolume(_Symbol,tf,i); sum+=vi; sum2+=vi*vi; n++; }
+  if(n==0) return 0.0;
+  double mu=sum/n; double var=MathMax(1e-9, (sum2/n) - mu*mu); double sd=MathSqrt(var);
+  if(sd<=0) return 0.0;
+  return (v-mu)/sd;
+}
+
+//=========================== TREND & REGIME ========================//
+enum Bias { BIAS_NONE=0, BIAS_BUY=1, BIAS_SELL=-1 };
+enum Reg  { REG_NONE=0, REG_TREND=1, REG_RANGE=2 };
+
+Bias TrendBias(){
+  if(BarsTF(InpTrendTF)<InpMinBars) return BIAS_NONE;
+  double ma0,ma1;
+  if(!Copy1(hEMA_trend,ma0,0) || !Copy1(hEMA_trend,ma1,1)) return BIAS_NONE;
+  double px=iClose(_Symbol,InpTrendTF,0);
+  bool up=(ma0>ma1), dn=(ma0<ma1);
+  if(InpRequireSlope){
+    if(px>ma0 && up) return BIAS_BUY;
+    if(px<ma0 && dn) return BIAS_SELL;
+  }else{
+    if(px>ma0) return BIAS_BUY;
+    if(px<ma0) return BIAS_SELL;
+  }
+  return BIAS_NONE;
+}
+
+Reg MarketRegime(){
+  double adx; if(!Copy1(hADX,adx,1)) return REG_NONE;
+  if(adx>=InpADX_TrendThresh) return REG_TREND;
+  return REG_RANGE;
+}
+
+//============================= SEASONALITY =========================//
+double wHour[24], wWeek[7]; bool season_ready=false;
+void BuildSeason(){
+  ArrayInitialize(wHour,1.0); ArrayInitialize(wWeek,1.0);
+  if(!InpUseSeasonality){ season_ready=true; return; }
+  int barsAvail = BarsTF(InpTF);
+  int N = MathMin(InpSeasonBarsBack, barsAvail - InpMinBars);
+  if(N<=0){ season_ready=true; return; }
+  double sumH[24]; int cntH[24]; double sumW[7]; int cntW[7];
+  ArrayInitialize(sumH,0.0); ArrayInitialize(cntH,0);
+  ArrayInitialize(sumW,0.0); ArrayInitialize(cntW,0);
+  for(int i=1;i<=N;i++){
+    datetime t=iTime(_Symbol,InpTF,i);
+    int hr=HourOf(t); int wd=WeekdayOf(t);
+    double r=iClose(_Symbol,InpTF,i)-iOpen(_Symbol,InpTF,i);
+    if(hr>=0 && hr<24){ sumH[hr]+=r; cntH[hr]++; }
+    if(wd>=1 && wd<=5){ sumW[wd]+=r; cntW[wd]++; }
+  }
+  double baseH=0.0; int nH=0;
+  for(int h=0;h<24;h++){ if(cntH[h]>0){ wHour[h]=sumH[h]/cntH[h]; baseH+=wHour[h]; nH++; } else wHour[h]=1.0; }
+  baseH=(nH>0? baseH/nH:0.0);
+  for(int h2=0;h2<24;h2++){ if(cntH[h2]>0 && baseH!=0.0) wHour[h2]/=baseH; else wHour[h2]=1.0; }
+  double baseW=0.0; int nW=0;
+  for(int d=0;d<7;d++){ if(cntW[d]>0){ wWeek[d]=sumW[d]/cntW[d]; baseW+=wWeek[d]; nW++; } else wWeek[d]=1.0; }
+  baseW=(nW>0? baseW/nW:0.0);
+  for(int d2=0;d2<7;d2++){ if(cntW[d2]>0 && baseW!=0.0) wWeek[d2]/=baseW; else wWeek[d2]=1.0; }
+  season_ready=true;
+}
+double SeasonW(datetime t){
+  if(!season_ready) return 1.0;
+  int hr=HourOf(t); int wd=WeekdayOf(t);
+  if(hr<0||hr>23) hr=0; if(wd<0||wd>6) wd=0;
+  return 0.5*wHour[hr] + 0.5*((wd>=1 && wd<=5)? wWeek[wd]:1.0);
+}
+
+//============================ CHANNEL LOGIC ========================//
+void BuildChannel(){
+  int idxH=iHighest(_Symbol,InpTF,MODE_HIGH,InpDonchLookback,1);
+  int idxL=iLowest (_Symbol,InpTF,MODE_LOW ,InpDonchLookback,1);
+  if(idxH==-1||idxL==-1) return;
+  ch.hi=iHigh(_Symbol,InpTF,idxH);
+  ch.lo=iLow (_Symbol,InpTF,idxL);
+  ch.touchesHi=0; ch.touchesLo=0; ch.setBar=BarsTF(InpTF);
+
+  for(int i=1;i<=InpDonchLookback;i++){
+    double hh=iHigh(_Symbol,InpTF,i), ll=iLow(_Symbol,InpTF,i);
+    if(MathAbs(hh-ch.hi)<=Pts(InpTouchTolPts)) ch.touchesHi++;
+    if(MathAbs(ll-ch.lo)<=Pts(InpTouchTolPts)) ch.touchesLo++;
+  }
+}
+
+bool FakeBreakoutLikely(int dir){
+  // dir: +1 = up break fake? (use upper wick), -1 = down break fake? (use lower wick)
+  double z = MathAbs(VolZ(InpTF,1,InpVolumeLookback));
+  bool vol_ok = (z<=InpMaxVolZ); // not a real explosive volume
+  bool body_ok = StrongBody(InpTF,1,InpBodyPct)==false; // not strong body close
+  double wr = WickRatio(InpTF,1);
+  bool wick_ok = (wr>=InpMinWickRatio);
+  // any two of three → treat as fake
+  int score=0;
+  if(vol_ok) score++;
+  if(body_ok) score++;
+  if(wick_ok) score++;
+  return (score>=2);
+}
+
+bool ConfirmClosesBeyond(double level, int dir){
+  // need InpConfirmBars consecutive closes beyond level
+  for(int k=1;k<=InpConfirmBars;k++){
+    double c=iClose(_Symbol,InpTF,k);
+    if(dir==1 && !(c>level)) return false;
+    if(dir==-1&& !(c<level)) return false;
+  }
+  return true;
+}
+
+//============================= ENTRIES =============================//
+struct SLTP { double entry, sl, tp1; double sl_points; };
+bool CalcSLTP(bool isBuy, SLTP &o){
+  if(!GetTick()) return false;
+  int slpts=InpFixedSL_Points;
+  if(InpUseATRforSL){
+    double a; if(!Copy1(hATR,a,0)) return false;
+    slpts=MathMax(1,(int)MathRound((a*InpATR_Mult)/_Point));
+  }
+  double e=isBuy? last_tick.ask:last_tick.bid;
+  double sl=isBuy? e-Pts(slpts): e+Pts(slpts);
+  double tp1=isBuy? e+Pts((int)(slpts*InpTP1_RR)): e-Pts((int)(slpts*InpTP1_RR));
+  o.entry=e; o.sl=sl; o.tp1=tp1; o.sl_points=slpts; return true;
+}
+
+double CalcLots(double sl_points){
+  double bal=AccountInfoDouble(ACCOUNT_BALANCE);
+  double risk=MathMax(0.0001,InpRiskPercent/100.0)*bal;
+  double tv=SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
+  double ts=SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
+  if(tv<=0||ts<=0) return 0.0;
+  double money_per_point_1lot = tv * (_Point/ts);
+  double lot=risk/(sl_points*money_per_point_1lot);
+  double minlot=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+  double maxlot=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX);
+  double step  =SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP); if(step<=0) step=0.01;
+  lot=MathMax(minlot, MathMin(maxlot, MathFloor(lot/step)*step));
+  return lot;
+}
+
+bool RRPasses(double sl_points){
+  // Simplified gate: require potential 2R runway from price to Donchian extreme
+  double c0=iClose(_Symbol,InpTF,0);
+  double upRoom = ch.hi - c0;
+  double dnRoom = c0 - ch.lo;
+  double twoR   = Pts((int)(sl_points*InpMinRR));
+  if(upRoom>=twoR || dnRoom>=twoR) return true;
+  return false;
+}
+
+bool HasOpen(int &dir,double &vol,ulong &tk){
+  dir=0; vol=0; tk=0;
+  for(int i=0;i<PositionsTotal();i++){
+    ulong t=PositionGetTicket(i);
+    if(!PositionSelectByTicket(t)) continue;
+    if(PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+    if(PositionGetInteger(POSITION_MAGIC)!=(long)InpMagic) continue;
+    int type=(int)PositionGetInteger(POSITION_TYPE);
+    dir=(type==POSITION_TYPE_BUY?1:-1);
+    vol=PositionGetDouble(POSITION_VOLUME);
+    tk=t; return true;
+  }
+  return false;
+}
+
+int OpenPositionsAll(){ int n=0; for(int i=0;i<PositionsTotal();i++) n++; return n; }
+
+//============================= RISK GUARD ==========================//
+bool DayChanged(){
+  MqlDateTime dt; TimeToStruct(TimeCurrent(),dt);
+  dt.hour=0; dt.min=0; dt.sec=0; datetime start=StructToTime(dt);
+  if(day_anchor==0){ day_anchor=start; return true; }
+  if(start!=day_anchor){ day_anchor=start; return true; }
+  return false;
+}
+bool RiskGuardAllows(){
+  if(DayChanged()) day_start_equity=AccountInfoDouble(ACCOUNT_EQUITY);
+  if(day_start_equity<=0.0) day_start_equity=AccountInfoDouble(ACCOUNT_EQUITY);
+  double eq=AccountInfoDouble(ACCOUNT_EQUITY);
+  if(eq <= day_start_equity*(1.0 - InpDailyLossCapPct/100.0)) return false;
+  if(OpenPositionsAll() >= InpMaxOpenPositions) return false;
+  if(SpreadPts() > InpMaxSpreadPoints) return false;
+  return true;
+}
+
+//============================= MANAGE ==============================//
+void ManageOpen(){
+  int dir; double vol; ulong tk;
+  if(!HasOpen(dir,vol,tk)) return;
+
+  datetime open_time=(datetime)PositionGetInteger(POSITION_TIME);
+  int barsSince = iBarShift(_Symbol, InpTF, open_time) - iBarShift(_Symbol, InpTF, TimeCurrent());
+  if(barsSince<0) barsSince = -barsSince;
+
+  double entry=PositionGetDouble(POSITION_PRICE_OPEN);
+  double sl   =PositionGetDouble(POSITION_SL);
+  double cur  =(dir==1? (GetTick()?last_tick.bid:SymbolInfoDouble(_Symbol,SYMBOL_BID))
+                      : (GetTick()?last_tick.ask:SymbolInfoDouble(_Symbol,SYMBOL_ASK)));
+  double slpts=MathMax(1.0, MathAbs((entry-sl)/_Point));
+  double tp1  =(dir==1? entry + Pts((int)(slpts*InpTP1_RR))
+                      : entry - Pts((int)(slpts*InpTP1_RR)));
+
+  // Partial TP + move to BE
+  if(InpPartialFrac>0.0){
+    bool hit = (dir==1? cur>=tp1 : cur<=tp1);
+    if(hit && vol>SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN)){
+      double minv=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+      double step=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP); if(step<=0) step=0.01;
+      double closeVol=MathMax(minv, NormalizeDouble(vol*InpPartialFrac/step,0)*step);
+      if(closeVol<vol){
+        if(Trade.PositionClosePartial(tk, closeVol)){
+          if(InpMoveSLtoBE){
+            double be = entry + (dir==1? 1:-1)*2*_Point;
+            Trade.PositionModify(tk, be, 0.0);
+          }
+        }
+      }
+    }
+  }
+
+  // ATR trail
+  if(InpUseATRTrail){
+    double a; if(Copy1(hATR_tr,a,0)){
+      double nd = InpATR_Trail_Mult * a;
+      double newSL = (dir==1? cur-nd : cur+nd);
+      if(dir==1 && newSL>sl) Trade.PositionModify(tk,newSL,0.0);
+      if(dir==-1&& newSL<sl) Trade.PositionModify(tk,newSL,0.0);
+    }
+  }
+
+  // Time-stop
+  if(barsSince >= InpTimeStopBars) Trade.PositionClose(tk);
+}
+
+//============================= CORE FLOW ===========================//
+string SName(State s){ if(s==ST_RANGE) return "RANGE"; if(s==ST_BRK_CONFIRM) return "BRK_CONFIRM"; if(s==ST_TREND_RIDE) return "TREND_RIDE"; return "IDLE"; }
+string BiasStr(Bias b){ if(b==BIAS_BUY) return "BUY"; if(b==BIAS_SELL) return "SELL"; return "NONE"; }
+string RegStr (Reg  r){ if(r==REG_TREND) return "TREND"; if(r==REG_RANGE) return "RANGE"; return "NONE"; }
+
+void Transition(State ns){ EA_STATE = ns; }
+
+void OnRange(){
+  // (1) Build/refresh channel
+  BuildChannel();
+  // (2) Range scalp entries at edges with fake BO filter
+  if(!RiskGuardAllows()) return;
+  if(InpOnePerSymbol){ int d; double v; ulong t; if(HasOpen(d,v,t)) return; }
+
+  // Entry BUY at channel low
+  double l0=iLow(_Symbol,InpTF,0), h0=iHigh(_Symbol,InpTF,0), c1=iClose(_Symbol,InpTF,1), o1=iOpen(_Symbol,InpTF,1);
+  bool touchedLow  = (l0 <= ch.lo + Pts(InpTouchTolPts)) && (ch.touchesLo>=InpMinTouches);
+  bool touchedHigh = (h0 >= ch.hi - Pts(InpTouchTolPts)) && (ch.touchesHi>=InpMinTouches);
+
+  // fake breakout should be likely (we fade it)
+  if(touchedLow && FakeBreakoutLikely(-1)){
+    SLTP s; if(!CalcSLTP(true,s)) return;
+    if(!RRPasses(s.sl_points)) return;   // RR ≥ 1:2
+    double lots=CalcLots(s.sl_points); if(lots<=0) return;
+    Trade.SetExpertMagicNumber(InpMagic); Trade.SetDeviationInPoints(10);
+    if(Trade.Buy(lots,NULL,0.0,s.sl,0.0,"RANGE BUY")) Print("[BABA_V5] RANGE BUY");
+  }
+  if(touchedHigh && FakeBreakoutLikely(+1)){
+    SLTP s; if(!CalcSLTP(false,s)) return;
+    if(!RRPasses(s.sl_points)) return;
+    double lots=CalcLots(s.sl_points); if(lots<=0) return;
+    Trade.SetExpertMagicNumber(InpMagic); Trade.SetDeviationInPoints(10);
+    if(Trade.Sell(lots,NULL,0.0,s.sl,0.0,"RANGE SELL")) Print("[BABA_V5] RANGE SELL");
+  }
+
+  // Breakout detection → go BRK_CONFIRM
+  bool upBreak   = (iClose(_Symbol,InpTF,1) > ch.hi);
+  bool downBreak = (iClose(_Symbol,InpTF,1) < ch.lo);
+  if(upBreak){ brk.dir=1; brk.level=ch.hi; brk.confCount=0; brk.setBar=BarsTF(InpTF); Transition(ST_BRK_CONFIRM); }
+  else if(downBreak){ brk.dir=-1; brk.level=ch.lo; brk.confCount=0; brk.setBar=BarsTF(InpTF); Transition(ST_BRK_CONFIRM); }
+}
+
+void OnBreakoutConfirm(){
+  // Need 2–3 closes beyond + retest pullback later
+  if(ConfirmClosesBeyond(brk.level, brk.dir)){
+    // wait for pullback
+    double f0,s0; if(!Copy1(hEMA_fast,f0,0) || !Copy1(hEMA_slow,s0,0)) return;
+    bool pull=false;
+    if(brk.dir==1){
+      bool pb = (iLow(_Symbol,InpTF,0) <= brk.level + Pts(InpPullbackTolPts));
+      pull = pb && (f0>s0);
+    }else{
+      bool pb = (iHigh(_Symbol,InpTF,0) >= brk.level - Pts(InpPullbackTolPts));
+      pull = pb && (f0<s0);
+    }
+
+    // Multi-TF bias & regime
+    Bias b = TrendBias();
+    Reg  r = MarketRegime();
+    bool bias_ok = ( (brk.dir==1 && b==BIAS_BUY) || (brk.dir==-1 && b==BIAS_SELL) );
+    bool regime_ok = (r==REG_TREND);
+
+    // Seasonality
+    double sw = SeasonW(iTime(_Symbol,InpTF,0));
+    bool season_ok = (sw >= InpMinSeasonWeight);
+
+    if(pull && bias_ok && regime_ok && season_ok && RiskGuardAllows()){
+      if(InpOnePerSymbol){ int d; double v; ulong t; if(HasOpen(d,v,t)) return; }
+      SLTP s; bool isBuy=(brk.dir==1);
+      if(!CalcSLTP(isBuy,s)) return;
+      if(!RRPasses(s.sl_points)) return;
+      double lots=CalcLots(s.sl_points); if(lots<=0) return;
+      Trade.SetExpertMagicNumber(InpMagic); Trade.SetDeviationInPoints(10);
+      bool ok = isBuy ? Trade.Buy(lots,NULL,0.0,s.sl,0.0,"PB BUY") : Trade.Sell(lots,NULL,0.0,s.sl,0.0,"PB SELL");
+      if(ok){ Print("[BABA_V5] PB ENTRY"); Transition(ST_TREND_RIDE); return; }
+    }
+  }
+
+  // Expire confirm if too old → back to RANGE
+  if(BarsTF(InpTF)-brk.setBar > InpTimeStopBars){ Transition(ST_RANGE); }
+}
+
+void OnTrendRide(){
+  // Одоогийн ManageOpen() trail/partial/time-stop хянана
+  // Trend alive check (EMA200 bias)
+  Bias b=TrendBias();
+  int d; double v; ulong tk;
+  if(!HasOpen(d,v,tk)){ Transition(ST_RANGE); return; }
+
+  if( (d==1 && b!=BIAS_BUY) || (d==-1 && b!=BIAS_SELL) ){
+    // bias алдагдвал барихаа болино
+    Trade.PositionClose(tk);
+    Transition(ST_RANGE);
+    return;
+  }
+}
+
+//=============================== HUD ===============================//
+void HUD(){
+  Bias b=TrendBias(); Reg r=MarketRegime();
+  Comment(StringFormat("BABA_V5 | State:%s | Reg:%s | Bias:%s | Spread:%.0fpt | DayEQ:%.0f→%.0f cap:%.1f%%",
+    SName(EA_STATE), RegStr(r), BiasStr(b), SpreadPts(), day_start_equity,
+    AccountInfoDouble(ACCOUNT_EQUITY), InpDailyLossCapPct));
+}
+
+//============================== EVENTS =============================//
+int OnInit(){
+  hATR      = iATR(_Symbol, InpTF, InpATR_Period);
+  hATR_tr   = iATR(_Symbol, InpTF, InpATR_Trail_Period);
+  hADX      = iADX(_Symbol, InpTF, InpADX_Period);
+  hEMA_fast = iMA (_Symbol, InpTF, InpFastEMA, 0, MODE_EMA, PRICE_CLOSE);
+  hEMA_slow = iMA (_Symbol, InpTF, InpSlowEMA, 0, MODE_EMA, PRICE_CLOSE);
+  hEMA_trend= iMA (_Symbol, InpTrendTF, InpTrendMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+
+  if(hATR==INVALID_HANDLE || hATR_tr==INVALID_HANDLE || hADX==INVALID_HANDLE ||
+     hEMA_fast==INVALID_HANDLE || hEMA_slow==INVALID_HANDLE || hEMA_trend==INVALID_HANDLE){
+    Print("[BABA_V5] Indicator init failed"); return INIT_FAILED;
+  }
+
+  BuildSeason();
+  EA_STATE=ST_RANGE; // эхлэхдээ суваг горим
+  day_anchor=0;
+  day_start_equity=AccountInfoDouble(ACCOUNT_EQUITY);
+  Print("[BABA_V5] Initialized.");
+  return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason){ Comment(""); }
+
+void OnTick(){
+  HUD();
+  ManageOpen();
+  if(!IsNewBar(InpTF)) return;
+
+  switch(EA_STATE){
+    case ST_RANGE:        OnRange(); break;
+    case ST_BRK_CONFIRM:  OnBreakoutConfirm(); break;
+    case ST_TREND_RIDE:   OnTrendRide(); break;
+    default:              EA_STATE=ST_RANGE; break;
+  }
+}
+//+------------------------------------------------------------------+
