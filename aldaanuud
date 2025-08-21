@@ -1,0 +1,434 @@
+Өмнөх алдаанууд — Нэгтгэл (санамж)
+
+isnan() ашигласан → MQL5-д байхгүй. Индикаторын буферийг EMPTY_VALUE-ээр шалгана.
+
+CopyBuffer буруу/аюулгүй бус ашиглалт → handle-ээ дахин дахин үүсгэдэг, ArraySetAsSeries тавиагүй, уртыг буруу авдаг байсан. Одоо: OnInit дээр handle үүсгээд, CopyBuffer-ийг 1 утгаар унших helper (CopyLatest) ашигладаг.
+
+Position давталт буруу → PositionGetTicket(i) гэх мэт. Зөв нь: PositionSelectByIndex(i) эсвэл CPositionInfo.SelectByIndex(i). Одоо CPositionInfo ашигладаг.
+
+Partial close хэмжээ → SYMBOL_VOLUME_STEP-ийг тооцоогүйгээс “volume invalid” гардаг. Одоо volume-оо step-ээр шалгаж/тасалж байна.
+
+Struct copy warning (Channel) → Объектыг утгаар дамжуулснаас анхааруулга өгдөг. Одоо Donchian-ыг хоёр хувьсагчаар (hi, lo) шууд буцаадаг.
+
+Нэг мөрт хуурай код (олон үйлдлийг нэг мөрт бичих) → Parser “) – expression expected” төрлийн алдаа өгдөг. Одоо мөр тус бүр болгож цэгцэлсэн.
+
+ModifySL нэртэй функц → Parser зарим build-д “SL undeclared” гэж гацсан. Одоо нэрийг SetStopLoss болгож тойрсон.
+
+Ternary илүүц/эргэлзээтэй (isBuy? entry : entry) → илүүц, бүгдийг цэвэрлэсэн.
+
+Static array + ArraySetAsSeries хольсон → “cannot be used for static allocated array”. Одоо динамик массив хэрэглэдэг.
+
+OrderSend/modify OK эсэх шалгалтгүй → Одоо бүхэнд амжилтын шалгалт + log хийдэг.
+
+Индикатор handle-ийг tick бүрт үүсгэх → Одоо OnInit дээр л үүсгэнэ.
+
+SL шинэчлээд дотоод утгаа шинэчлээгүй → trail-дахдаа хуучин SL-тэй үлддэг. Одоо sl_now = newSL; гэж шинэчилдэг.
+
+
+
+
+double entry=pos.PriceOpen(); double sl_now=pos.SL(); bool isBuy=(pos.PositionType()==POSITION_TYPE_BUY); Энэ мөр дээр 2 алдаа заасан код
+//+------------------------------------------------------------------+
+//|                                                SmartTrendEA.mq5  |
+//|                                           BABA MT5 BOT – V7.2    |
+//|  Clean MT5‑idiomatic EA (CTrade/CPositionInfo, safe CopyBuffer)  |
+//|  Flow: Range → Confirmed Breakout → Retest → Trend Ride          |
+//|  RM: 1% risk, Partial@1R → BE → ATR trail, MTF(EMA) confirm      |
+//+------------------------------------------------------------------+
+#property copyright "BABA & Hypatia"
+#property version   "7.2"
+#property strict
+
+#include <Trade/Trade.mqh>
+#include <Trade/PositionInfo.mqh>
+
+// ============================== Inputs =============================== //
+input double   InpRiskPercent           = 1.0;    // Risk per trade (% of balance)
+input int      InpSL_Buffer_Points      = 20;     // SL buffer beyond structure/ATR
+
+// Channel / Breakout
+input int      InpDonchianPeriod        = 50;     // Donchian lookback (bars)
+input int      InpBreakoutConfirmCount  = 2;      // Bars closing outside to confirm
+input int      InpRetestMaxBars         = 8;      // Max bars to wait for retest
+
+// Ride
+input int      InpATR_Period            = 14;     // ATR period (entry TF)
+input double   InpATR_TrailMult         = 2.0;    // ATR trailing multiplier
+input int      InpFractalDepth          = 5;      // Fractal swing depth
+input double   InpPartialTP_R           = 1.0;    // Partial TP at 1R
+input double   InpPartialTP_Percent     = 50.0;   // Close % at partial TP
+
+// Filters
+input int      InpRSI_Period            = 14;     // RSI period (entry TF)
+input int      InpRSI_MinTrend          = 55;     // Min RSI for longs (100-55 for shorts)
+input bool     InpUseMomentumFilter     = true;   // Use RSI momentum filter
+
+// Multi‑TF (EMA slow alignment)
+input ENUM_TIMEFRAMES InpTF_Fast        = PERIOD_M15;   // Entry TF
+input ENUM_TIMEFRAMES InpTF_Mid         = PERIOD_M30;   // Mid TF
+input ENUM_TIMEFRAMES InpTF_Slow        = PERIOD_H1;    // Slow TF
+input int      InpEMA_Fast              = 50;           // Fast EMA (entry TF)
+input int      InpEMA_Slow              = 200;          // Slow EMA (filters)
+input bool     InpRequire_MTF_Align     = true;         // Require alignment across TFs
+
+// Execution
+input bool     InpAllowLong             = true;
+input bool     InpAllowShort            = true;
+input int      InpMagic                 = 56001117;     // Magic number
+
+// ============================== Globals ============================== //
+enum EAState { STATE_RANGE=0, STATE_BREAKOUT_WAIT=1, STATE_TREND_RIDE=2 };
+EAState g_state = STATE_RANGE;
+
+struct BreakoutCtx { bool up; datetime t_confirm; double level; bool armed; };
+BreakoutCtx g_brk = {false, 0, 0.0, false};
+
+CTrade        trade;
+CPositionInfo pos;
+
+ulong  g_pos_ticket   = 0;
+bool   g_partial_done = false;
+
+// Indicator handles (created in OnInit)
+int hATR=INVALID_HANDLE, hRSI=INVALID_HANDLE, hFr=INVALID_HANDLE;
+int hEmaFastE=INVALID_HANDLE, hEmaSlowE=INVALID_HANDLE, hEmaSlowM=INVALID_HANDLE, hEmaSlowS=INVALID_HANDLE;
+
+// ============================== Utils ================================ //
+int    DigitsAdjust(){ return (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS); }
+double PointValue(){ return SymbolInfoDouble(_Symbol, SYMBOL_POINT); }
+
+double Bid(){ return SymbolInfoDouble(_Symbol, SYMBOL_BID); }
+double Ask(){ return SymbolInfoDouble(_Symbol, SYMBOL_ASK); }
+
+bool IsNewBar()
+{
+   static datetime last=0; datetime t=iTime(_Symbol, PERIOD_CURRENT, 0);
+   if(t!=last){ last=t; return true; } return false;
+}
+
+void GetDonchian(int period, double &hi, double &lo)
+{
+   int hiShift = iHighest(_Symbol, PERIOD_CURRENT, MODE_HIGH, period, 1);
+   int loShift = iLowest (_Symbol, PERIOD_CURRENT, MODE_LOW,  period, 1);
+   hi = iHigh(_Symbol, PERIOD_CURRENT, hiShift);
+   lo = iLow (_Symbol, PERIOD_CURRENT, loShift);
+}
+
+bool CopyLatest(int handle, int buffer_index, double &out)
+{
+   double b[]; ArraySetAsSeries(b,true);
+   if(CopyBuffer(handle, buffer_index, 0, 1, b)<1) return false;
+   out=b[0]; return true;
+}
+
+bool MomentumOK(bool forLong)
+{
+   if(!InpUseMomentumFilter) return true;
+   if(hRSI==INVALID_HANDLE) return true;
+   double r; if(!CopyLatest(hRSI,0,r)) return true;
+   return forLong? (r>=InpRSI_MinTrend) : (r<=100-InpRSI_MinTrend);
+}
+
+bool MTF_Aligned(bool forLong)
+{
+   if(!InpRequire_MTF_Align) return true;
+   double eFast, eSlowE, eSlowM, eSlowS;
+   if(!CopyLatest(hEmaFastE,0,eFast))  return false;
+   if(!CopyLatest(hEmaSlowE,0,eSlowE)) return false;
+   if(!CopyLatest(hEmaSlowM,0,eSlowM)) return false;
+   if(!CopyLatest(hEmaSlowS,0,eSlowS)) return false;
+   double px=Bid();
+   if(forLong) return (px>eSlowE && px>eSlowM && px>eSlowS && eFast>eSlowE);
+   return (px<eSlowE && px<eSlowM && px<eSlowS && eFast<eSlowE);
+}
+
+int LastFractalShift(bool up)
+{
+   if(hFr==INVALID_HANDLE) return -1;
+   double upb[], dnb[]; ArraySetAsSeries(upb,true); ArraySetAsSeries(dnb,true);
+   if(CopyBuffer(hFr,0,0,100,upb)<1) return -1;  // up
+   if(CopyBuffer(hFr,1,0,100,dnb)<1) return -1;  // down
+   for(int i=InpFractalDepth; i<100; i++)
+   {
+     if( up && upb[i]!=EMPTY_VALUE)  return i;
+     if(!up && dnb[i]!=EMPTY_VALUE)  return i;
+   }
+   return -1;
+}
+
+bool BreakoutConfirmed(double chHigh, double chLow, bool &up)
+{
+   int cnt=0; int dir=0; // +1 above, -1 below
+   for(int i=1;i<=InpBreakoutConfirmCount;i++)
+   {
+      double c=iClose(_Symbol,PERIOD_CURRENT,i);
+      int d = (c>chHigh)? +1 : ((c<chLow)? -1 : 0);
+      if(d==0) return false;                 // inside channel → not confirmed
+      if(dir==0) dir=d; else if(d!=dir) return false; // mixed sides → no
+      cnt++;
+   }
+   up = (dir==+1);
+   return (cnt==InpBreakoutConfirmCount);
+}
+
+bool RetestHappened(bool up, double chHigh, double chLow, int &bars_back)
+{
+   bars_back=0;
+   for(int i=1;i<=InpRetestMaxBars;i++)
+   {
+      double lo=iLow(_Symbol,PERIOD_CURRENT,i); double hi=iHigh(_Symbol,PERIOD_CURRENT,i);
+      if(up){ if(lo<=chHigh){ bars_back=i; return true; } }
+      else  { if(hi>=chLow ){ bars_back=i; return true; } }
+   }
+   return false;
+}
+
+bool SelectOurPosition()
+{
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      if(!pos.SelectByIndex(i)) continue;
+      if(pos.Symbol()==_Symbol && (int)pos.Magic()==InpMagic){ g_pos_ticket=(ulong)pos.Ticket(); return true; }
+   }
+   g_pos_ticket=0; return false;
+}
+
+// ============================== Risk/Orders ========================== //
+double CalcPositionSize(double stop_points)
+{
+   if(stop_points<=0) return 0.0;
+   double balance=AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskAmt = balance*InpRiskPercent/100.0;
+
+   double tick_value = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
+   double tick_size  = SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
+   double lot_step   = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP); if(lot_step<=0) lot_step=0.01;
+   double pnt        = PointValue();
+
+   // Money per point for 1 lot (approx)
+   double money_per_point_1lot = (tick_value/tick_size) * pnt; if(money_per_point_1lot<=0) money_per_point_1lot=1.0;
+
+   double vol = riskAmt/(stop_points*money_per_point_1lot);
+
+   double min_lot=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN); if(min_lot<=0) min_lot=0.01;
+   double max_lot=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX); if(max_lot<=0) max_lot=100.0;
+   vol = MathMax(min_lot, MathMin(max_lot, MathFloor(vol/lot_step)*lot_step));
+   return vol;
+}
+
+bool SetStopLoss(double newSL)
+{
+   if(!SelectOurPosition()) return false;
+   double tp = PositionGetDouble(POSITION_TP); // safe read
+   bool ok = trade.PositionModify(_Symbol, newSL, tp);
+   if(!ok) Print("SetStopLoss failed: ", _LastError);
+   return ok;
+}
+
+void DoPartial(double percent)
+{
+   if(!SelectOurPosition()) return;
+   double step=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP); if(step<=0) step=0.01;
+   double vol = pos.Volume();
+   double closeVol=MathFloor((vol*percent/100.0)/step)*step; if(closeVol<step) return;
+   if(!trade.PositionClosePartial(_Symbol, closeVol)) Print("Partial close failed: ", _LastError);
+}
+
+bool CloseAll()
+{
+   if(!SelectOurPosition()) return true;
+   bool ok = trade.PositionClose(_Symbol);
+   if(!ok) Print("Close failed: ", _LastError);
+   return ok;
+}
+
+bool OpenEntry(bool buy, double sl, double vol)
+{
+   trade.SetExpertMagicNumber(InpMagic);
+   bool ok=false;
+   if(buy) ok = trade.Buy(vol, NULL, 0.0, sl, 0.0);
+   else    ok = trade.Sell(vol, NULL, 0.0, sl, 0.0);
+   if(!ok) Print("Entry failed: ", _LastError);
+   return ok;
+}
+
+// ============================== Lifecycle =========================== //
+int OnInit()
+{
+   trade.SetExpertMagicNumber(InpMagic);
+
+   // Create indicator handles (respect TF params)
+   hATR      = iATR(_Symbol, PERIOD_CURRENT, InpATR_Period);
+   hRSI      = iRSI(_Symbol, PERIOD_CURRENT, InpRSI_Period, PRICE_CLOSE);
+   hFr       = iFractals(_Symbol, PERIOD_CURRENT);
+   hEmaFastE = iMA(_Symbol, InpTF_Fast, InpEMA_Fast, 0, MODE_EMA, PRICE_CLOSE);
+   hEmaSlowE = iMA(_Symbol, InpTF_Fast, InpEMA_Slow, 0, MODE_EMA, PRICE_CLOSE);
+   hEmaSlowM = iMA(_Symbol, InpTF_Mid,  InpEMA_Slow, 0, MODE_EMA, PRICE_CLOSE);
+   hEmaSlowS = iMA(_Symbol, InpTF_Slow, InpEMA_Slow, 0, MODE_EMA, PRICE_CLOSE);
+
+   if(hATR==INVALID_HANDLE || hRSI==INVALID_HANDLE || hFr==INVALID_HANDLE ||
+      hEmaFastE==INVALID_HANDLE || hEmaSlowE==INVALID_HANDLE || hEmaSlowM==INVALID_HANDLE || hEmaSlowS==INVALID_HANDLE)
+   { Print("Handle create failed"); return(INIT_FAILED); }
+
+   Print("SmartTrendEA V7.2 started");
+   return(INIT_SUCCEEDED);
+}
+
+void OnDeinit(const int reason){ Print("SmartTrendEA V7.2 stopped"); }
+
+void OnTick()
+{
+   if(!IsNewBar()) return; // bar‑close logic only
+
+   double chHigh, chLow; GetDonchian(InpDonchianPeriod, chHigh, chLow);
+
+   switch(g_state)
+   {
+      case STATE_RANGE:
+      {
+         bool up=false; bool ok=BreakoutConfirmed(chHigh, chLow, up);
+         if(ok)
+         {
+            g_brk.up=up; g_brk.level= up?chHigh:chLow; g_brk.t_confirm=TimeCurrent(); g_brk.armed=true;
+            g_partial_done=false; g_state=STATE_BREAKOUT_WAIT;
+            Print("Breakout confirmed ", (up?"UP":"DOWN"));
+         }
+         break;
+      }
+
+      case STATE_BREAKOUT_WAIT:
+      {
+         if(!g_brk.armed){ g_state=STATE_RANGE; break; }
+         int bars_since=0; bool ret = RetestHappened(g_brk.up, chHigh, chLow, bars_since);
+         if(!ret)
+         {
+            if(bars_since>=InpRetestMaxBars){ g_state=STATE_RANGE; g_brk.armed=false; Print("Retest timeout"); }
+            break;
+         }
+
+         if(!MTF_Aligned(g_brk.up)) { Print("MTF not aligned"); g_state=STATE_RANGE; g_brk.armed=false; break; }
+         if(!MomentumOK(g_brk.up))  { Print("Momentum weak");  g_state=STATE_RANGE; g_brk.armed=false; break; }
+
+         // Entry & SL behind swing/ATR
+         int digs=DigitsAdjust(); double pt=PointValue();
+         double bid=Bid(); double ask=Ask();
+         double atr_now; bool atr_ok=CopyLatest(hATR,0,atr_now);
+         if(!atr_ok) atr_now=0.0;
+
+         int swUp=LastFractalShift(true);  int swDn=LastFractalShift(false);
+         double entry=0.0, sl=0.0;
+
+         if(g_brk.up)
+         {
+            if(!InpAllowLong){ g_state=STATE_RANGE; g_brk.armed=false; break; }
+            entry=ask;
+            double sl_struct = (swDn>0)? iLow(_Symbol,PERIOD_CURRENT,swDn) : (entry - InpATR_TrailMult*atr_now);
+            sl = sl_struct - InpSL_Buffer_Points*pt;
+         }
+         else
+         {
+            if(!InpAllowShort){ g_state=STATE_RANGE; g_brk.armed=false; break; }
+            entry=bid;
+            double sl_struct = (swUp>0)? iHigh(_Symbol,PERIOD_CURRENT,swUp) : (entry + InpATR_TrailMult*atr_now);
+            sl = sl_struct + InpSL_Buffer_Points*pt;
+         }
+
+         double stop_pts = MathAbs(entry-sl)/pt; if(stop_pts<=0){ g_state=STATE_RANGE; g_brk.armed=false; break; }
+         double vol = CalcPositionSize(stop_pts);  if(vol<=0){ g_state=STATE_RANGE; g_brk.armed=false; break; }
+
+         if(OpenEntry(g_brk.up, NormalizeDouble(sl,digs), vol))
+         {
+            g_state=STATE_TREND_RIDE; g_partial_done=false;
+         }
+         else { g_state=STATE_RANGE; g_brk.armed=false; }
+         break;
+      }
+
+      case STATE_TREND_RIDE:
+      {
+         if(!SelectOurPosition()){ g_state=STATE_RANGE; g_brk.armed=false; break; }
+         int digs=DigitsAdjust(); double pt=PointValue();
+         double entry=pos.PriceOpen(); double sl_now=pos.SL(); bool isBuy=(pos.PositionType()==POSITION_TYPE_BUY);
+         double bid=Bid(), ask=Ask();
+
+         // Partial @1R → BE
+         if(!g_partial_done)
+         {
+            double stop_pts = MathAbs(entry - sl_now)/pt;
+            double target1R = isBuy? (entry + stop_pts*pt*InpPartialTP_R) : (entry - stop_pts*pt*InpPartialTP_R);
+            double pxNow = isBuy? bid: ask;
+            bool hit = (isBuy && pxNow>=target1R) || (!isBuy && pxNow<=target1R);
+            if(hit)
+            {
+               DoPartial(InpPartialTP_Percent);
+               SetStopLoss(NormalizeDouble(entry,digs));
+               g_partial_done=true; Print("Partial TP & BE");
+            }
+         }
+
+         // ATR trail
+         double atr_now; if(CopyLatest(hATR,0,atr_now))
+         {
+            double trail = InpATR_TrailMult * atr_now;
+            double newSL = isBuy ? (bid - trail) : (ask + trail);
+            bool better = (isBuy && newSL > sl_now) || (!isBuy && newSL < sl_now);
+            if(better)
+            {
+               SetStopLoss(NormalizeDouble(newSL, digs));
+               sl_now = newSL;
+            }
+         }
+
+         // --- Trend end: price vs slow EMA + swing break (safe) ---
+double eSlowE = entry;
+double tmpSlow;
+if (CopyLatest(hEmaSlowE, 0, tmpSlow))
+    eSlowE = tmpSlow;
+
+bool   exit  = false;
+int    sw    = -1;
+double swing = 0.0;
+
+if (isBuy)
+{
+    sw    = LastFractalShift(false);
+    swing = (sw > 0) ? iLow(_Symbol, PERIOD_CURRENT, sw) : 1e10;
+    if (bid < eSlowE && bid < swing)
+        exit = true;
+}
+else
+{
+    sw    = LastFractalShift(true);
+    swing = (sw > 0) ? iHigh(_Symbol, PERIOD_CURRENT, sw) : -1e10;
+    if (ask > eSlowE && ask > swing)
+        exit = true;
+}
+
+if (exit)
+{
+    CloseAll();
+    g_state        = STATE_RANGE;
+    g_brk.armed    = false;
+    g_partial_done = false;
+    break;                 // << switch CASE доторх break-ийг энд байрлуулна
+}
+
+
+         if(exit)
+         {
+            CloseAll();
+            g_state=STATE_RANGE; g_brk.armed=false; g_partial_done=false;
+         }
+         break;
+      }
+   }
+}
+
+// ============================== Notes =============================== //
+// • Robust against previous issues: no isnan, no static arrays, no parser‑tricky one‑liners.
+// • Uses CTrade/CPositionInfo; position loops via SelectByIndex; symbol‑scoped modify/close.
+// • Handles created in OnInit; all indicator reads via CopyBuffer → CopyLatest.
+// • Donchian via iHighest/iLowest; TF alignment via 50/200 EMAs (configurable).
+// • New‑bar only logic; strict risk & partial/BE/ATR trailing; swing+EMA exit.
+//+------------------------------------------------------------------+
+ 
