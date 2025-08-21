@@ -1,0 +1,88 @@
+# BABA MT5 Bot — NOTES
+
+Энэ файл нь EA хөгжүүлэлтийн явцыг (V1 → V6) тоймлон тэмдэглэсэн Timeline Log + дараагийн шатанд ашиглах Шар тэмдэглэл юм.  
+
+---
+
+## 📜 Timeline Log
+
+### V1 — Kick-off Skeleton
+- 🎯 Эхлэл: EA framework (SL/TP, equity info).
+- 🚧 Алдаа: Strategy logic бараг байгаагүй.
+- ✅ Сургамж: Framework суурь бэлэн болсон.
+
+### V2 — RiskGuard суурь
+- 🎯 Нэмсэн: Day loss cap, max exposure, 1%/trade sizing.
+- 🚧 Алдаа: Logic бүрэн бус.
+- ✅ Сургамж: Risk management чухал гэдэг нь батлагдсан.
+
+### V3 — EMA & Breakout Skeleton
+- 🎯 Нэмсэн: H1 EMA200 bias, Donchian breakout core, partial TP + BE + ATR trail эхлэл.
+- 🚧 Алдаа: TimeDayOfWeek(), iVolume cast warning.
+- ✅ Сургамж: Trend-following bias ажиллаж эхэлсэн.
+
+### V4 — Aegis
+- 🎯 Нэмсэн: RiskGuard v1 (day cap + time-stop), breakout confirm сайжруулалт.
+- 🚧 Алдаа: Хэт олон false breakout.
+- ✅ Сургамж: RiskGuard сууж өгсөн.
+
+### V4.1 — TrendRide
+- 🎯 Нэмсэн: EMA pullback logic (multi-TF confirm).
+- 🚧 Алдаа: Зарим боломж алдсан.
+- ✅ Сургамж: EMA bias хүчтэй filter боловч хэт чанга байж болно.
+
+### V5 — PatternAware
+- 🎯 Нэмсэн:
+  - Mode (Auto / Range / Trend).
+  - Fake breakout 2/3 шалгалт (wick/body/volume z-score).
+  - Counter-Scalp Guard.
+- 🚧 Алдаа: Compile error (жишээ: line 297).
+- ✅ Сургамж: Pattern-aware логик нэмэгдсэн.
+
+### V6 — StateMachine (Balanced Preset 1%)
+- 🎯 Нэмсэн:
+  - Mode=Auto, CounterScalpGuard=ON.
+  - Cooldown (loss дараах амралт).
+  - Day limits & Session filter.
+  - Balanced Preset: 1%/trade, RR≥2, Partial TP+BE, ATR trail.
+- 🚧 Critical bug:
+  - Cooldown logic → `iBarShift(TimeCurrent)` үргэлж 0 → cooldown үргэлж ON болсон.
+- ✅ Засвар:
+  - `lastExitBarIndex` + `BarsTF()` ашиглаж зөв индекс тооцсон.
+- 📌 Нэмэлт зөвлөмж:
+  - InpMaxTradesPerDay = 6–8
+  - SeasonWeight = 0.85–0.90
+  - ConfirmBars = 1 (thin market үед)
+
+---
+
+## 🟨 Шар тэмдэглэл (дараагийн шатанд хэрэглэх)
+
+- **Preset**: Balanced 1%  
+  - Mode=Auto  
+  - CounterScalpGuard=ON  
+  - Cooldown=5 bars  
+  - DayLossCap=2%  
+  - RR ≥ 2  
+  - Partial 50%@1R → BE → ATR trail  
+
+- **Critical bug**: Cooldown барын индекс → FIXED (`lastExitBarIndex`, `BarsTF`).  
+
+- **Metrics зорилго**:  
+  - PF ≥ 1.5  
+  - MaxDD ≤ 15%  
+  - Win ≈ 50–55%  
+  - AvgR ≈ 1.8–2.0  
+
+- **Test protocol**:  
+  - Visual (M5/M15) 6–12 сар  
+  - Demo forward 1–2 долоо хоног  
+
+- **Adjustable knobs**:  
+  - DonchLookback  
+  - ATR_Mult  
+  - ATR_Trail_Mult  
+  - ConfirmBars  
+  - MinTouches  
+
+---
