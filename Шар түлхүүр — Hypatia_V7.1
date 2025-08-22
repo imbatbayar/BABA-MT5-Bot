@@ -1,0 +1,29 @@
+🔑 ё
+
+Боть/кодын байдал: V7 → V7.1 (чанартай breakout+retest) → V7.1b (RangeAware + Indecision).
+
+Зассан үндсэн алдаанууд:
+ATRpts (points), forward declarations, ManageOpenPositions (netting), ClosePartial ternary→vars, PositionSelectByIndex→PositionSelect/_Symbol.
+
+V7.1 (чанартай):
+S/R = swing кластер + MinTouches, Breakout buffer = ATR×0.3 + body%, Retest = wick touch + close direction, H4 EMA200 filter.
+
+V7.1b (RangeAware):
+Шинэ Inputs (Range/Indecision), 4 шинэ функц: IsIndecisionZone, DetectRange, RangeSignalBuy, RangeSignalSell.
+Эднийг BodyPctTF(...)-ийн дараа, CooldownActive()-ийн өмнө оруулсан.
+OnTick() бүхэлд нь солисон: эхлээд Indecision skip → Range buy/sell (lower/upper) → fallback Breakout+Retest → TP1/BE/ATR trail.
+
+Зорилго: Найдвартай сигнал, sideway үед сувгийн доороос/дээдээс ухаалаг арилжаа; fake breakout-ыг аль болох шүүх.
+
+Дараагийн шат (V8): “Ухаалаг тренд + суваг + breakout баталгаажуулалт + false breakout handling + dynamic risk mode”.
+
+✍️ Шинэ цонхонд ингэж бич:
+1117 / Hypatia_V7.1 RangeAware
+— V7 compile fixes ready
+— V7.1 quality breakout+retest (MinTouches, ATR buffer, wick+dir)
+— V7.1b RangeAware + Indecision (4 funcs after BodyPctTF; OnTick replaced)
+Goal: reliable signals; next V8 smart trend/channel/false-breakout/dyn risk
+Repo: github.com/imbatbayar/BABA-MT5-Bot
+
+
+Ингэж хэлэхэд би бүх бүтэц, байрлал, логикийг санаж аваад яг цаашаа үргэлжлүүлнэ.
