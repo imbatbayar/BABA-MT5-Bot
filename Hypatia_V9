@@ -1,7 +1,7 @@
 //+------------------------------------------------------------------+
 //|                          Hypatia_V9 (Conservative Stable Build)  |
 //|  SmartTrend(H4/H1) + Breakout→Retest + Range + EMA50 Pullback    |
-//|  TradeIO wrapper (fills/steps/stops clamp) → 4756 таглана        |
+//|  TradeIO wrapper: IOC/FOK auto-retry (RETURN хориг)              |
 //|  RiskGuard 2.0: Spread, ATR-spike, Cooldown, Day/Month DD caps   |
 //|  PositionMgmt: 50%@1R→BE, ATR trail, Time-Stop                   |
 //+------------------------------------------------------------------+
@@ -104,13 +104,15 @@ int    DigitsSym(){ return (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS); }
 double PointSym(){  return SymbolInfoDouble(_Symbol, SYMBOL_POINT); }
 double NormalizePrice(double p){ return NormalizeDouble(p, DigitsSym()); }
 
+// --- Filling chooser: RETURN-г бүрмөсөн хориглоно, IOC/FOK л ашиглана.
 ENUM_ORDER_TYPE_FILLING PickFilling()
 {
    long mask = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
-   if(mask & ORDER_FILLING_RETURN) return ORDER_FILLING_RETURN;
-   if(mask & ORDER_FILLING_IOC)    return ORDER_FILLING_IOC;
-   return ORDER_FILLING_FOK;
+   if( (mask & ORDER_FILLING_IOC) != 0 ) return ORDER_FILLING_IOC;
+   if( (mask & ORDER_FILLING_FOK) != 0 ) return ORDER_FILLING_FOK;
+   return ORDER_FILLING_IOC; // аюулгүй default
 }
+
 bool PrepareVolume(double &vol)
 {
    double minv = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
@@ -168,7 +170,7 @@ bool ATRSpike()
    return spike;
 }
 
-// Unified OrderSend
+// --- Unified OrderSend (IOC/FOK авто‑retry, RETURN хэзээ ч үгүй)
 bool SendDeal(ENUM_ORDER_TYPE type, double vol, double &price, double &sl, double &tp, string tag, int deviation)
 {
    if(!PrepareVolume(vol)){ if(InpDebugLogs) Print("[V9-IO] Volume invalid"); return false; }
@@ -193,11 +195,19 @@ bool SendDeal(ENUM_ORDER_TYPE type, double vol, double &price, double &sl, doubl
    r.comment      = tag;
 
    bool ok = OrderSend(r, s);
+
+   // --- INVALID_FILL (10030) илэрвэл IOC↔FOK солиж дахин оролдоно
+   if(!ok && (s.retcode==TRADE_RETCODE_INVALID_FILL || s.retcode==10030))
+   {
+      r.type_filling = (r.type_filling==ORDER_FILLING_IOC) ? ORDER_FILLING_FOK : ORDER_FILLING_IOC;
+      ok = OrderSend(r, s);
+   }
+
    if(InpDebugLogs)
       PrintFormat("[V9-IO] %s vol=%.2f ok=%s ret=%d cmt=%s  px=%.5f sl=%.5f tp=%.5f fill=%d",
          EnumToString(type), vol, ok?"T":"F", s.retcode, s.comment, r.price, r.sl, r.tp, r.type_filling);
 
-   return (s.retcode==TRADE_RETCODE_DONE);
+   return (s.retcode==TRADE_RETCODE_DONE || s.retcode==TRADE_RETCODE_PLACED);
 }
 bool SendSLTP(double sl,double tp)
 {
@@ -226,6 +236,14 @@ void HUD(string s)
    ObjectSetInteger(0,name,OBJPROP_YDISTANCE,18);
    ObjectSetInteger(0,name,OBJPROP_FONTSIZE,8);
    ObjectSetString(0,name,OBJPROP_TEXT,s);
+}
+void DrawLiveSignal(bool isBuy,double price) // сонголт: амжилттай нээсэн үед дуудах
+{
+   const string nm="V9SIG_CURR";
+   ObjectDelete(0,nm);
+   ObjectCreate(0, nm, OBJ_ARROW, 0, iTime(_Symbol, PERIOD_CURRENT, 0), price);
+   ObjectSetInteger(0,nm,OBJPROP_ARROWCODE, isBuy?241:242); // ▲/▼
+   ObjectSetInteger(0,nm,OBJPROP_WIDTH,2);
 }
 
 //======================== Indicators =================================
@@ -503,11 +521,14 @@ bool OpenPosition(int dir, double entry, double sl, double tp)
    bool ok = SendDeal(t, lots, px, slx, tpx, "V9", InpMaxDeviation);
    if(!ok && InpDebugLogs)
       PrintFormat("[V9] Order rejected. dir=%d lots=%.2f sl=%.5f tp=%.5f", dir, lots, sl, tp);
+   if(ok) DrawLiveSignal(dir==1, px);  // амжилттай үед амьд сум зурна
    return ok;
 }
 bool ClosePartial(ulong ticket, double frac)
 {
-   if(!PositionSelectByTicket(ticket)) return false;
+   if(!PositionSelectByTicket(ticket)) PositionSelect(_Symbol);
+   if(!PositionSelect(_Symbol)) return false;
+
    double vol=PositionGetDouble(POSITION_VOLUME);
    double step=SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    double part=MathFloor(vol*frac/step)*step;
@@ -523,7 +544,9 @@ bool ClosePartial(ulong ticket, double frac)
 }
 bool MoveSLtoBE(ulong ticket, double entry_price)
 {
-   if(!PositionSelectByTicket(ticket)) return false;
+   if(!PositionSelectByTicket(ticket)) PositionSelect(_Symbol);
+   if(!PositionSelect(_Symbol)) return false;
+
    long type=PositionGetInteger(POSITION_TYPE);
    double curSL=PositionGetDouble(POSITION_SL);
    double be=NormalizePrice(entry_price);
@@ -536,7 +559,9 @@ bool MoveSLtoBE(ulong ticket, double entry_price)
 }
 bool UpdateATRTrail(ulong ticket, double atr_pts, double entry)
 {
-   if(!PositionSelectByTicket(ticket)) return false;
+   if(!PositionSelectByTicket(ticket)) PositionSelect(_Symbol);
+   if(!PositionSelect(_Symbol)) return false;
+
    long type=PositionGetInteger(POSITION_TYPE);
    double price=(type==POSITION_TYPE_BUY)? SymbolInfoDouble(_Symbol,SYMBOL_BID)
                                          : SymbolInfoDouble(_Symbol,SYMBOL_ASK);
@@ -587,17 +612,12 @@ void ManageOpenPositions()
    {
       datetime tOpen=(datetime)PositionGetInteger(POSITION_TIME);
       int shOpen=iBarShift(_Symbol, InpTF, tOpen, true);
-      int shNow =0;
-      if(shOpen>=0)
+      int elapsed = shOpen - 0;
+      if(elapsed >= InpTimeStopBars && rrNowPts < (InpTimeStopMinRR*riskPts))
       {
-         int elapsed = shOpen - shNow;
-         if(elapsed >= InpTimeStopBars && rrNowPts < (InpTimeStopMinRR*riskPts))
-         {
-            // market close
-            ENUM_ORDER_TYPE ot=(type==POSITION_TYPE_BUY)? ORDER_TYPE_SELL:ORDER_TYPE_BUY;
-            double px=0, slx=0, tpx=0;
-            SendDeal(ot, PositionGetDouble(POSITION_VOLUME), px, slx, tpx, "V9-TimeStop", InpMaxDeviation);
-         }
+         ENUM_ORDER_TYPE ot=(type==POSITION_TYPE_BUY)? ORDER_TYPE_SELL:ORDER_TYPE_BUY;
+         double px=0, slx=0, tpx=0;
+         SendDeal(ot, PositionGetDouble(POSITION_VOLUME), px, slx, tpx, "V9-TimeStop", InpMaxDeviation);
       }
    }
 }
@@ -621,7 +641,6 @@ bool IsIndecisionZone()
    }
    return (smallCnt >= (n*3)/5);
 }
-
 bool CooldownActive()
 {
    bool useBars=(InpCooldownBars>0), useMins=(InpCooldownMinutes>0);
@@ -639,7 +658,6 @@ bool CooldownActive()
    }
    return false;
 }
-
 void RefreshEquityAnchors()
 {
    MqlDateTime tm; TimeToStruct(TimeCurrent(), tm);
@@ -657,7 +675,6 @@ void RefreshEquityAnchors()
       if(InpDebugLogs) PrintFormat("[V9] Month anchor set: %.2f", g_monthStartEquity);
    }
 }
-
 bool DrawdownExceeded()
 {
    RefreshEquityAnchors();
@@ -726,7 +743,7 @@ void OnTick()
    bool up   = TrendUp();
    bool down = TrendDown();
 
-   // Pending retest state
+   // --- Pending retest state
    if(g_waitRetest)
    {
       int barsNow = iBars(_Symbol, InpTF);
@@ -761,7 +778,7 @@ void OnTick()
       }
    }
 
-   // Range mode
+   // --- Range mode
    if(InpEnableRangeMode)
    {
       double U=0,L=0; int tU=0,tD=0;
@@ -787,7 +804,7 @@ void OnTick()
       }
    }
 
-   // Breakout detect -> state
+   // --- Breakout detect -> state
    if(InpLongs && up && !HasOpenPosition(1))
    {
       int sh=0; double lvl=0.0;
@@ -801,7 +818,7 @@ void OnTick()
       { g_waitRetest=true; g_breakUp=false; g_breakLevel=lvl; g_breakBar=iBars(_Symbol, InpTF); }
    }
 
-   // Pullback continuation (Micro EMA50)
+   // --- Pullback continuation (Micro EMA50)
    if(!g_waitRetest)
    {
       double atrp=ATRpts(InpTF, InpATR);
@@ -852,7 +869,7 @@ void OnTick()
       }
    }
 
-   // HUD/Logs
+   // --- HUD/Logs
    if(InpDebugLogs && NewBar())
    {
       string msg=StringFormat("UP:%d DN:%d wait:%d lvl:%.5f TTL:%d  indec:%d",
