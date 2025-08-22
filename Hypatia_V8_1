@@ -1,0 +1,760 @@
+//+------------------------------------------------------------------+
+//|                                                   Hypatia_V8_1   |
+//| SmartTrend+Channel (macro H4 + micro H1), Breakout→Retest state  |
+//| Fakeout counter (opt), EMA50 pullback fallback, Dynamic risk     |
+//| Warm-up fix, Donchian fallback, Debug HUD                        |
+//+------------------------------------------------------------------+
+#property strict
+
+//=== Inputs: General
+input ENUM_TIMEFRAMES InpTF        = PERIOD_H1;    // Entry TF
+input int             InpMagic     = 880009;       // Magic
+input double          InpRiskPct   = 1.0;          // Default risk (%)
+input double          InpMaxDDDay  = 5.0;
+input double          InpMaxDDMon  = 15.0;
+input bool            InpLongs     = true;
+input bool            InpShorts    = true;
+
+//=== Trend / ATR / EMA
+input ENUM_TIMEFRAMES InpTFTrend   = PERIOD_H4;    // Macro TF
+input int             InpEMA       = 200;
+input ENUM_TIMEFRAMES InpTFMicro   = PERIOD_H1;    // Micro TF
+input int             InpEMAMicro  = 50;
+input int             InpATR       = 14;
+
+//=== Breakout + Retest (зөөлрүүлсэн default)
+input int    InpSRLookback        = 80;
+input int    InpMinTouches        = 2;
+input int    InpMaxBarsRetest     = 6;
+input int    InpConfirmBodyPct    = 40;            // 45 -> 40
+input double InpBreakBuffATR      = 0.20;          // 0.25 -> 0.20
+input double InpRetestTolATR      = 0.50;
+input double InpRetestWickMinPct  = 30.0;          // 35 -> 30
+
+//=== Cooldown
+input int    InpCooldownBars      = 6;
+input int    InpCooldownMinutes   = 0;
+
+//=== Position mgmt
+input bool   InpUseTP1_BE_Trail   = true;
+input double InpRR_TP1            = 1.0;
+input double InpTrailATRmult      = 2.0;
+
+//=== Range / Indecision
+input bool   InpEnableRangeMode       = true;
+input int    InpRangeLookback         = 60;
+input double InpRangeMinWidthATR      = 0.8;        // 1.0 -> 0.8 (илүү уян)
+input double InpRangeSlopeATRPerBar   = 0.10;       // 0.08 -> 0.10
+input int    InpRangeMinTouches       = 2;
+input double InpRangeTouchTolATR      = 0.30;
+input bool   InpRangeIgnoreEMA        = true;
+
+input bool   InpSkipIndecision        = false;      // default OFF
+input int    InpIndecN                = 5;
+input double InpIndecBodyPctMax       = 28.0;
+input double InpIndecRangeATR         = 0.55;
+
+//=== V8: Smart Trend, Risk & State
+input bool   InpStrictTrendMatch   = false; // true: Macro&&Micro, false: Macro only
+input bool   InpUseDynamicRisk     = true;
+input double InpRiskTrendPct       = 1.0;
+input double InpRiskRangePct       = 0.5;
+input double InpRiskCounterPct     = 0.4;
+
+input int    InpRetestTTLBars      = 12;    // 8 -> 12 (илүү боломж)
+input int    InpFalseBreakWindow   = 2;
+input bool   InpEnableCounterFB    = true;
+
+// Pullback continuation (Micro EMA50)
+input double InpPB_NearEMAAtr      = 0.30;
+input double InpPB_WickMinPct      = 28.0;  // 30 -> 28
+
+//=== Debug / HUD
+input bool   InpDebugLogs          = true;
+input bool   InpDrawHUD            = true;
+
+//=== Globals
+datetime g_lastLossTime = 0;
+int      g_lastLossBar  = -1;     // WARM-UP FIX: -1 (эхлэхэд cooldown OFF)
+
+double   g_point, g_tickvalue;
+int      g_digits;
+
+// Retest state
+bool   g_waitRetest = false;
+bool   g_breakUp    = false;
+double g_breakLevel = 0.0;
+int    g_breakBar   = -1;
+
+// one-shot risk override
+double g_riskOverridePct = -1.0;
+
+// prev bar time (HUD/лог)
+datetime g_prevBarTime = 0;
+
+//=== Forward decl
+double  EMA(ENUM_TIMEFRAMES tf, int period, int shift=0);
+double  ATRpts(ENUM_TIMEFRAMES tf, int period, int shift=0);
+double  PipsToPrice(double pips);
+bool    AllowedSession();
+bool    DrawdownExceeded();
+bool    NewBar();
+void    HUD(string s);
+
+bool    MacroTrendUp();
+bool    MacroTrendDown();
+bool    MicroTrendUp();
+bool    MicroTrendDown();
+bool    TrendUp();
+bool    TrendDown();
+
+bool    IsIndecisionZone();
+
+bool    DetectRange(double &upper, double &lower, int &touchUp, int &touchDn);
+bool    RangeSignalBuy(double upper, double lower, double atr_pts,
+                       double &entryPrice, double &slPrice, double &slPts);
+bool    RangeSignalSell(double upper, double lower, double atr_pts,
+                        double &entryPrice, double &slPrice, double &slPts);
+
+bool    FindLevelUp(double &level_price, int &touches);
+bool    FindLevelDown(double &level_price, int &touches);
+bool    DonchianLevels(int len, double &upper, double &lower);
+bool    BreakoutUp_Q(int &breakShift, double &level_price);
+bool    BreakoutDown_Q(int &breakShift, double &level_price);
+
+bool    RetestReadyNow(bool up, double level_price,
+                       double &entryPrice, double &slPrice, double &slPts);
+bool    DetectFalseBreak(bool up, double level, int window);
+
+bool    HasOpenPosition(int dir);
+bool    OpenPosition(int dir, double entry, double sl, double tp);
+double  LotsForRisk(double sl_points);
+bool    ClosePartial(ulong ticket, double frac);
+bool    MoveSLtoBE(ulong ticket, double entry_price);
+bool    UpdateATRTrail(ulong ticket, double atr_pts, double entry);
+void    ManageOpenPositions();
+
+void    SetRiskOnce(double pct);
+double  PickRisk(bool trendMode, bool counterMode=false);
+
+//=== Impl
+double PipsToPrice(double pips){ return pips * g_point; }
+
+int OnInit()
+{
+   g_point     = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   g_tickvalue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   g_digits    = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   g_lastLossTime = 0;
+   g_lastLossBar  = -1;   // WARM-UP FIX
+
+   Print("Hypatia_V8_1 init OK");
+   return(INIT_SUCCEEDED);
+}
+void OnDeinit(const int reason){ Print("Hypatia_V8_1 deinit. reason=", reason); }
+
+bool AllowedSession(){ return true; }
+bool DrawdownExceeded(){ return false; }
+
+bool NewBar()
+{
+   datetime t=iTime(_Symbol, InpTF, 0);
+   if(t!=g_prevBarTime){ g_prevBarTime=t; return true; }
+   return false;
+}
+void HUD(string s)
+{
+   if(!InpDrawHUD) return;
+   string name="HypaHUD";
+   if(ObjectFind(0,name)<0) ObjectCreate(0,name,OBJ_LABEL,0,0,0);
+   ObjectSetInteger(0,name,OBJPROP_CORNER,CORNER_RIGHT_UPPER);
+   ObjectSetInteger(0,name,OBJPROP_XDISTANCE,12);
+   ObjectSetInteger(0,name,OBJPROP_YDISTANCE,18);
+   ObjectSetInteger(0,name,OBJPROP_FONTSIZE,8);
+   ObjectSetString(0,name,OBJPROP_TEXT,s);
+}
+
+//--- EMA/ATR
+double EMA(ENUM_TIMEFRAMES tf, int period, int shift)
+{
+   int h=iMA(_Symbol, tf, period, 0, MODE_EMA, PRICE_CLOSE);
+   if(h==INVALID_HANDLE) return 0.0;
+   double b[]; if(CopyBuffer(h,0,shift,1,b)<1) return 0.0;
+   return b[0];
+}
+double ATRpts(ENUM_TIMEFRAMES tf, int period, int shift)
+{
+   int h=iATR(_Symbol, tf, period);
+   if(h==INVALID_HANDLE) return 0.0;
+   double b[]; if(CopyBuffer(h,0,shift,1,b)<1) return 0.0;
+   return b[0]/_Point;
+}
+
+//--- Body%
+double BodyPctTF(ENUM_TIMEFRAMES tf, int shift)
+{
+   MqlRates r[]; if(CopyRates(_Symbol, tf, shift, 2, r)<2) return 0.0;
+   double body=MathAbs(r[0].close-r[0].open), range=(r[0].high-r[0].low);
+   if(range<=0) return 0.0;
+   return (body/range)*100.0;
+}
+
+//--- Macro/Micro & composite
+bool MacroTrendUp()   { return SymbolInfoDouble(_Symbol,SYMBOL_BID) > EMA(InpTFTrend, InpEMA, 0); }
+bool MacroTrendDown() { return SymbolInfoDouble(_Symbol,SYMBOL_ASK) < EMA(InpTFTrend, InpEMA, 0); }
+bool MicroTrendUp()   { return iClose(_Symbol, InpTFMicro, 0)      > EMA(InpTFMicro, InpEMAMicro, 0); }
+bool MicroTrendDown() { return iClose(_Symbol, InpTFMicro, 0)      < EMA(InpTFMicro, InpEMAMicro, 0); }
+
+bool TrendUp()
+{
+   return InpStrictTrendMatch ? (MacroTrendUp() && MicroTrendUp())
+                              : MacroTrendUp();
+}
+bool TrendDown()
+{
+   return InpStrictTrendMatch ? (MacroTrendDown() && MicroTrendDown())
+                              : MacroTrendDown();
+}
+
+//--- Indecision
+bool IsIndecisionZone()
+{
+   if(!InpSkipIndecision) return false;
+   double atrp = ATRpts(InpTF, InpATR); if(atrp<=0) return false;
+   int n = MathMax(3, InpIndecN);
+   MqlRates r[]; if(CopyRates(_Symbol, InpTF, 0, n, r) < n) return false;
+   int smallCnt = 0;
+   for(int i=0;i<n;i++)
+   {
+      double body = MathAbs(r[i].close - r[i].open);
+      double range= (r[i].high  - r[i].low);
+      double bodyPct = (range>0 ? (body/range)*100.0 : 0.0);
+      bool smallBody = (bodyPct <= InpIndecBodyPctMax);
+      bool smallRange= ((range/_Point) <= atrp*InpIndecRangeATR);
+      if(smallBody && smallRange) smallCnt++;
+   }
+   return (smallCnt >= (n*3)/5);
+}
+
+//--- Range detect
+bool DetectRange(double &upper, double &lower, int &touchUp, int &touchDn)
+{
+   upper=0.0; lower=0.0; touchUp=0; touchDn=0;
+   int need = InpRangeLookback + 5;
+   MqlRates r[]; if(CopyRates(_Symbol, InpTF, 0, need, r) < InpRangeLookback) return false;
+   double atrp = ATRpts(InpTF, InpATR); if(atrp<=0) return false;
+
+   double hi=r[1].high, lo=r[1].low;
+   for(int i=1;i<=InpRangeLookback;i++){ hi=MathMax(hi, r[i].high); lo=MathMin(lo, r[i].low); }
+
+   double widthPts = (hi - lo)/_Point;
+   if(widthPts < atrp*InpRangeMinWidthATR) return false;
+
+   double slopePtsPerBar = MathAbs((r[0].close - r[InpRangeLookback].close)/_Point) / InpRangeLookback;
+   if(slopePtsPerBar > atrp*InpRangeSlopeATRPerBar) return false;
+
+   double tol = atrp*InpRangeTouchTolATR;
+   for(int i=1;i<=InpRangeLookback;i++)
+   {
+      if(MathAbs((r[i].high/_Point) - (hi/_Point)) <= tol) touchUp++;
+      if(MathAbs((r[i].low/_Point)  - (lo/_Point))  <= tol) touchDn++;
+   }
+   if(touchUp < InpRangeMinTouches || touchDn < InpRangeMinTouches) return false;
+
+   upper = hi; lower = lo; return true;
+}
+
+//--- Range entries
+bool RangeSignalBuy(double upper, double lower, double atr_pts,
+                    double &entryPrice, double &slPrice, double &slPts)
+{
+   double tol = atr_pts*InpRangeTouchTolATR;
+   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if( ((price/_Point) - (lower/_Point)) > tol ) return false;
+
+   double bodyPct = BodyPctTF(InpTF, 0);
+   if(bodyPct < 18.0) return false;
+
+   entryPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   slPts  = atr_pts*1.0;
+   slPrice= entryPrice - PipsToPrice(slPts);
+   return true;
+}
+bool RangeSignalSell(double upper, double lower, double atr_pts,
+                     double &entryPrice, double &slPrice, double &slPts)
+{
+   double tol = atr_pts*InpRangeTouchTolATR;
+   double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   if( ((upper/_Point) - (price/_Point)) > tol ) return false;
+
+   double bodyPct = BodyPctTF(InpTF, 0);
+   if(bodyPct < 18.0) return false;
+
+   entryPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   slPts  = atr_pts*1.0;
+   slPrice= entryPrice + PipsToPrice(slPts);
+   return true;
+}
+
+//--- Donchian fallback for breakout level
+bool DonchianLevels(int len, double &upper, double &lower)
+{
+   upper=0; lower=0;
+   MqlRates r[]; if(CopyRates(_Symbol, InpTF, 0, len+2, r)<len) return false;
+   double hi=r[1].high, lo=r[1].low;
+   for(int i=1;i<=len;i++){ hi=MathMax(hi, r[i].high); lo=MathMin(lo, r[i].low); }
+   upper=hi; lower=lo; return (upper>lower);
+}
+
+//--- Swing clustering levels
+bool FindLevelUp(double &level_price, int &touches)
+{
+   level_price=0.0; touches=0;
+   int need=InpSRLookback+5;
+   MqlRates r[]; if(CopyRates(_Symbol, InpTF, 0, need, r)<need/2) return false;
+
+   double atrp=ATRpts(InpTF, InpATR); if(atrp<=0) return false;
+   double tol_pts=atrp*0.25;
+
+   double cand[256]; int csz=0; int n=ArraySize(r);
+   for(int i=1;i<n-1 && csz<256;i++)
+      if(r[i].high>r[i-1].high && r[i].high>r[i+1].high)
+         cand[csz++]=r[i].high/_Point;
+   if(csz==0) return false;
+
+   int bestTouch=0; double bestLvl=0.0;
+   for(int k=0;k<csz;k++){
+      double lvl=cand[k]; int t=0;
+      for(int j=1;j<n;j++)
+         if(MathAbs((r[j].high/_Point)-lvl)<=tol_pts) t++;
+      if(t>=InpMinTouches && (t>bestTouch || (t==bestTouch && lvl>bestLvl)))
+      { bestTouch=t; bestLvl=lvl; }
+   }
+   if(bestTouch<InpMinTouches) return false;
+   level_price=bestLvl*_Point; touches=bestTouch; return true;
+}
+bool FindLevelDown(double &level_price, int &touches)
+{
+   level_price=0.0; touches=0;
+   int need=InpSRLookback+5;
+   MqlRates r[]; if(CopyRates(_Symbol, InpTF, 0, need, r)<need/2) return false;
+
+   double atrp=ATRpts(InpTF, InpATR); if(atrp<=0) return false;
+   double tol_pts=atrp*0.25;
+
+   double cand[256]; int csz=0; int n=ArraySize(r);
+   for(int i=1;i<n-1 && csz<256;i++)
+      if(r[i].low<r[i-1].low && r[i].low<r[i+1].low)
+         cand[csz++]=r[i].low/_Point;
+   if(csz==0) return false;
+
+   int bestTouch=0; double bestLvl=0.0;
+   for(int k=0;k<csz;k++){
+      double lvl=cand[k]; int t=0;
+      for(int j=1;j<n;j++)
+         if(MathAbs((r[j].low/_Point)-lvl)<=tol_pts) t++;
+      if(t>=InpMinTouches && (t>bestTouch || (t==bestTouch && lvl<bestLvl)))
+      { bestTouch=t; bestLvl=lvl; }
+   }
+   if(bestTouch<InpMinTouches) return false;
+   level_price=bestLvl*_Point; touches=bestTouch; return true;
+}
+
+//--- Breakout with Donchian fallback
+bool BreakoutUp_Q(int &breakShift, double &level_price)
+{
+   int touch=0;
+   bool ok=FindLevelUp(level_price, touch);
+   if(!ok){
+      double u,l; if(!DonchianLevels(InpSRLookback,u,l)) return false;
+      level_price=u; // fallback
+   }
+   double atrp=ATRpts(InpTF, InpATR); if(atrp<=0) return false;
+   MqlRates rr[]; if(CopyRates(_Symbol, InpTF, 0, 1, rr)<1) return false;
+   double close0=rr[0].close;
+   if(BodyPctTF(InpTF,0) < InpConfirmBodyPct) return false;
+   if( (close0 - level_price) < PipsToPrice(atrp*InpBreakBuffATR) ) return false;
+   breakShift=0; return true;
+}
+bool BreakoutDown_Q(int &breakShift, double &level_price)
+{
+   int touch=0;
+   bool ok=FindLevelDown(level_price, touch);
+   if(!ok){
+      double u,l; if(!DonchianLevels(InpSRLookback,u,l)) return false;
+      level_price=l; // fallback
+   }
+   double atrp=ATRpts(InpTF, InpATR); if(atrp<=0) return false;
+   MqlRates rr[]; if(CopyRates(_Symbol, InpTF, 0, 1, rr)<1) return false;
+   double close0=rr[0].close;
+   if(BodyPctTF(InpTF,0) < InpConfirmBodyPct) return false;
+   if( (level_price - close0) < PipsToPrice(atrp*InpBreakBuffATR) ) return false;
+   breakShift=0; return true;
+}
+
+//--- Retest & Fakeout
+bool RetestReadyNow(bool up, double level_price,
+                    double &entryPrice, double &slPrice, double &slPts)
+{
+   double atrp = ATRpts(InpTF, InpATR); if(atrp<=0) return false;
+   double tol  = atrp*InpRetestTolATR;
+   MqlRates r[]; if(CopyRates(_Symbol, InpTF, 0, 2, r)<2) return false;
+
+   double h=r[0].high, l=r[0].low, o=r[0].open, c=r[0].close;
+   bool touched = up ? (MathAbs((level_price/_Point)-(l/_Point))<=tol)
+                     : (MathAbs((level_price/_Point)-(h/_Point))<=tol);
+   double range=h-l; if(range<=0) return false;
+   double upperW=h-MathMax(o,c), lowerW=MathMin(o,c)-l;
+   double wickPct = (up ? (lowerW/range) : (upperW/range))*100.0;
+   bool dirOK   = up ? (c>=o) : (c<=o);
+
+   if(!(touched && dirOK && wickPct>=InpRetestWickMinPct)) return false;
+
+   if(up){ entryPrice=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+           slPts=atrp*1.2; slPrice=entryPrice-PipsToPrice(slPts); }
+   else  { entryPrice=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+           slPts=atrp*1.2; slPrice=entryPrice+PipsToPrice(slPts); }
+   return true;
+}
+bool DetectFalseBreak(bool up, double level, int window)
+{
+   for(int i=1;i<=window;i++){
+      double c=iClose(_Symbol, InpTF, i);
+      if(up && c<level)  return true;
+      if(!up && c>level) return true;
+   }
+   return false;
+}
+
+//--- Risk helpers
+void SetRiskOnce(double pct){ g_riskOverridePct = pct; }
+double PickRisk(bool trendMode, bool counterMode)
+{
+   if(!InpUseDynamicRisk) return InpRiskPct;
+   if(counterMode) return InpRiskCounterPct;
+   return (trendMode ? InpRiskTrendPct : InpRiskRangePct);
+}
+double LotsForRisk(double sl_points)
+{
+   if(sl_points<=0.0) return 0.0;
+   double equity=AccountInfoDouble(ACCOUNT_EQUITY);
+   double useRiskPct = (g_riskOverridePct>0.0 ? g_riskOverridePct : InpRiskPct);
+   double riskUSD=equity*(useRiskPct/100.0);
+   double tvpp=g_tickvalue/(1.0/g_point);
+   double step=SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double minLot=SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot=SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lots=riskUSD/(sl_points*tvpp);
+   lots=MathFloor(lots/step)*step;
+   lots=MathMax(minLot, MathMin(maxLot, lots));
+   g_riskOverridePct = -1.0;
+   return lots;
+}
+
+//--- Positions
+bool HasOpenPosition(int dir)
+{
+   if(!PositionSelect(_Symbol)) return false;
+   if(PositionGetInteger(POSITION_MAGIC)!=InpMagic) return false;
+   long type=PositionGetInteger(POSITION_TYPE);
+   if(dir==1  && type==POSITION_TYPE_BUY ) return true;
+   if(dir==-1 && type==POSITION_TYPE_SELL) return true;
+   return false;
+}
+bool ClosePartial(ulong ticket, double frac)
+{
+   if(!PositionSelectByTicket(ticket)) return false;
+   double vol=PositionGetDouble(POSITION_VOLUME);
+   double step=SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double part=MathFloor(vol*frac/step)*step;
+   if(part<=0) return false;
+
+   long posType=PositionGetInteger(POSITION_TYPE);
+   ENUM_ORDER_TYPE ot=(posType==POSITION_TYPE_BUY)? ORDER_TYPE_SELL:ORDER_TYPE_BUY;
+   double px=(ot==ORDER_TYPE_SELL)? SymbolInfoDouble(_Symbol,SYMBOL_BID)
+                                  : SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+
+   MqlTradeRequest req; ZeroMemory(req);
+   MqlTradeResult  res; ZeroMemory(res);
+   req.action=TRADE_ACTION_DEAL; req.magic=InpMagic; req.symbol=_Symbol;
+   req.deviation=20; req.type=ot; req.volume=part; req.price=px;
+   bool ok=OrderSend(req,res);
+   if(!ok) Print("Partial close failed: ", _LastError);
+   return ok;
+}
+bool MoveSLtoBE(ulong ticket, double entry_price)
+{
+   if(!PositionSelectByTicket(ticket)) return false;
+   double curSL=PositionGetDouble(POSITION_SL);
+   long   type =PositionGetInteger(POSITION_TYPE);
+   double be=entry_price;
+   if(curSL==0 || (type==POSITION_TYPE_BUY && curSL<be) || (type==POSITION_TYPE_SELL && curSL>be))
+   {
+      MqlTradeRequest req; ZeroMemory(req);
+      MqlTradeResult  res; ZeroMemory(res);
+      req.action=TRADE_ACTION_SLTP; req.magic=InpMagic; req.symbol=_Symbol;
+      req.sl=be; req.tp=PositionGetDouble(POSITION_TP);
+      bool ok=OrderSend(req,res);
+      if(!ok) Print("BE move failed: ", _LastError);
+      return ok;
+   }
+   return true;
+}
+bool UpdateATRTrail(ulong ticket, double atr_pts, double entry)
+{
+   if(!PositionSelectByTicket(ticket)) return false;
+   long type=PositionGetInteger(POSITION_TYPE);
+   double price=(type==POSITION_TYPE_BUY)? SymbolInfoDouble(_Symbol,SYMBOL_BID)
+                                         : SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+   double trailPts=atr_pts*InpTrailATRmult;
+   double newSL;
+   if(type==POSITION_TYPE_BUY)
+   {
+      newSL=price - PipsToPrice(trailPts);
+      if(newSL>PositionGetDouble(POSITION_SL))
+      { MqlTradeRequest req; ZeroMemory(req); MqlTradeResult res; ZeroMemory(res);
+        req.action=TRADE_ACTION_SLTP; req.magic=InpMagic; req.symbol=_Symbol;
+        req.sl=newSL; req.tp=PositionGetDouble(POSITION_TP); return OrderSend(req,res); }
+   }
+   else
+   {
+      newSL=price + PipsToPrice(trailPts);
+      if(newSL<PositionGetDouble(POSITION_SL))
+      { MqlTradeRequest req; ZeroMemory(req); MqlTradeResult res; ZeroMemory(res);
+        req.action=TRADE_ACTION_SLTP; req.magic=InpMagic; req.symbol=_Symbol;
+        req.sl=newSL; req.tp=PositionGetDouble(POSITION_TP); return OrderSend(req,res); }
+   }
+   return true;
+}
+bool OpenPosition(int dir, double entry, double sl, double tp)
+{
+   double slPts=MathAbs((entry-sl)/g_point);
+   double lots=LotsForRisk(slPts);
+   if(lots<=0){ if(InpDebugLogs) Print("Lots calc <=0"); return false; }
+
+   MqlTradeRequest req; ZeroMemory(req);
+   MqlTradeResult  res; ZeroMemory(res);
+   req.action=TRADE_ACTION_DEAL; req.magic=InpMagic; req.symbol=_Symbol;
+   req.deviation=20; req.volume=lots;
+   if(dir==1){ req.type=ORDER_TYPE_BUY;  req.price=SymbolInfoDouble(_Symbol,SYMBOL_ASK); }
+   else      { req.type=ORDER_TYPE_SELL; req.price=SymbolInfoDouble(_Symbol,SYMBOL_BID); }
+   req.sl=sl; req.tp=tp;
+
+   bool ok=OrderSend(req,res);
+   if(!ok) Print("OrderSend fail: ", _LastError);
+   return ok;
+}
+void ManageOpenPositions()
+{
+   if(!InpUseTP1_BE_Trail) return;
+   if(!PositionSelect(_Symbol)) return;
+   if(PositionGetInteger(POSITION_MAGIC)!=InpMagic) return;
+
+   ulong  t    =(ulong)PositionGetInteger(POSITION_TICKET);
+   long   type =PositionGetInteger(POSITION_TYPE);
+   double entry=PositionGetDouble(POSITION_PRICE_OPEN);
+   double sl   =PositionGetDouble(POSITION_SL);
+
+   double priceBid=SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double priceAsk=SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double price=(type==POSITION_TYPE_BUY)? priceBid:priceAsk;
+
+   double riskPts=MathAbs((entry-sl)/g_point);
+   if(riskPts<=0) return;
+
+   double rrNowPts = (type==POSITION_TYPE_BUY)? (price-entry)/g_point : (entry-price)/g_point;
+
+   if(rrNowPts >= (InpRR_TP1 * riskPts))
+   { ClosePartial(t, 0.5); MoveSLtoBE(t, entry); }
+
+   double atrp=ATRpts(InpTF, InpATR);
+   UpdateATRTrail(t, atrp, entry);
+}
+
+//=== Cooldown on loss
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result)
+{
+   if(trans.type!=TRADE_TRANSACTION_DEAL_ADD) return;
+   long dtype=(long)HistoryDealGetInteger(trans.deal, DEAL_TYPE);
+   long dentry=(long)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   if(dtype==DEAL_TYPE_BALANCE) return;
+
+   double profit=(double)HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
+   if(dentry==DEAL_ENTRY_OUT && profit<0.0)
+   {
+      g_lastLossTime=(datetime)HistoryDealGetInteger(trans.deal, DEAL_TIME);
+      g_lastLossBar =iBars(_Symbol, InpTF);
+      Print("Loss detected -> cooldown armed. time=", TimeToString(g_lastLossTime));
+   }
+}
+
+//=== TICK
+void OnTick()
+{
+   if(!AllowedSession()) return;
+   if(DrawdownExceeded()) return;
+   if(CooldownActive())   return;
+   if(IsIndecisionZone()) return;
+
+   bool up   = TrendUp();
+   bool down = TrendDown();
+
+   // Pending retest state
+   if(g_waitRetest)
+   {
+      int barsNow = iBars(_Symbol, InpTF);
+
+      if(InpEnableCounterFB && DetectFalseBreak(g_breakUp, g_breakLevel, InpFalseBreakWindow))
+      {
+         double e=0,s=0,sp=0, atrp=ATRpts(InpTF, InpATR);
+         if(atrp>0)
+         {
+            if(g_breakUp) { e=SymbolInfoDouble(_Symbol,SYMBOL_BID); sp=atrp*1.2; s=e + PipsToPrice(sp);
+                            SetRiskOnce(PickRisk(false,true));
+                            double tp=(InpUseTP1_BE_Trail?0.0:(e - PipsToPrice(sp*2.0)));
+                            if(OpenPosition(-1,e,s,tp)){ g_waitRetest=false; ManageOpenPositions(); return; } }
+            else          { e=SymbolInfoDouble(_Symbol,SYMBOL_ASK); sp=atrp*1.2; s=e - PipsToPrice(sp);
+                            SetRiskOnce(PickRisk(false,true));
+                            double tp=(InpUseTP1_BE_Trail?0.0:(e + PipsToPrice(sp*2.0)));
+                            if(OpenPosition(1,e,s,tp)){ g_waitRetest=false; ManageOpenPositions(); return; } }
+         }
+      }
+
+      if(barsNow - g_breakBar > InpRetestTTLBars) { g_waitRetest=false; }
+      else {
+         double e=0,s=0,sp=0;
+         if(RetestReadyNow(g_breakUp, g_breakLevel, e, s, sp))
+         {
+            SetRiskOnce(PickRisk(true,false));
+            double tp = (InpUseTP1_BE_Trail ? 0.0
+                       : (g_breakUp ? (e + PipsToPrice(sp*2.0))
+                                    : (e - PipsToPrice(sp*2.0))));
+            if(OpenPosition(g_breakUp?1:-1, e, s, tp)){ g_waitRetest=false; ManageOpenPositions(); return; }
+         }
+      }
+   }
+
+   // Range mode
+   if(InpEnableRangeMode)
+   {
+      double U=0,L=0; int tU=0,tD=0;
+      if(DetectRange(U,L,tU,tD))
+      {
+         double atrp=ATRpts(InpTF, InpATR);
+         if(InpLongs && (InpRangeIgnoreEMA || up) && !HasOpenPosition(1))
+         {
+            double e=0,s=0,sp=0;
+            if(RangeSignalBuy(U,L,atrp,e,s,sp))
+            { SetRiskOnce(PickRisk(false,false));
+              double tp=(InpUseTP1_BE_Trail?0.0:(e + PipsToPrice(sp*2.0)));
+              if(OpenPosition(1,e,s,tp)){ ManageOpenPositions(); return; } }
+         }
+         if(InpShorts && (InpRangeIgnoreEMA || down) && !HasOpenPosition(-1))
+         {
+            double e=0,s=0,sp=0;
+            if(RangeSignalSell(U,L,atrp,e,s,sp))
+            { SetRiskOnce(PickRisk(false,false));
+              double tp=(InpUseTP1_BE_Trail?0.0:(e - PipsToPrice(sp*2.0)));
+              if(OpenPosition(-1,e,s,tp)){ ManageOpenPositions(); return; } }
+         }
+      }
+   }
+
+   // Breakout detect -> state
+   if(InpLongs && up && !HasOpenPosition(1))
+   {
+      int sh=0; double lvl=0.0;
+      if(BreakoutUp_Q(sh, lvl))
+      { g_waitRetest=true; g_breakUp=true;  g_breakLevel=lvl; g_breakBar=iBars(_Symbol, InpTF); }
+   }
+   if(InpShorts && down && !HasOpenPosition(-1))
+   {
+      int sh=0; double lvl=0.0;
+      if(BreakoutDown_Q(sh, lvl))
+      { g_waitRetest=true; g_breakUp=false; g_breakLevel=lvl; g_breakBar=iBars(_Symbol, InpTF); }
+   }
+
+   // Pullback continuation (Micro EMA50)
+   if(!g_waitRetest)
+   {
+      double atrp=ATRpts(InpTF, InpATR);
+      if(atrp>0)
+      {
+         if(InpLongs && up && !HasOpenPosition(1))
+         {
+            double ema=EMA(InpTFMicro, InpEMAMicro, 0);
+            double tol=PipsToPrice(atrp*InpPB_NearEMAAtr);
+            double h=iHigh(_Symbol, InpTF, 0), l=iLow(_Symbol, InpTF, 0),
+                   o=iOpen(_Symbol, InpTF, 0), c=iClose(_Symbol, InpTF, 0);
+            bool near=(MathAbs(c-ema)<=tol)||(l<=ema+tol);
+            double range=h-l; if(range>0)
+            {
+               double lowerW=(MathMin(o,c)-l);
+               double wickPct=(lowerW/range)*100.0;
+               if(near && c>=o && wickPct>=InpPB_WickMinPct)
+               {
+                  double e=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+                  double sp=atrp*1.3; double s=e-PipsToPrice(sp);
+                  SetRiskOnce(PickRisk(true,false));
+                  double tp=(InpUseTP1_BE_Trail?0.0:(e + PipsToPrice(sp*2.0)));
+                  if(OpenPosition(1,e,s,tp)){ ManageOpenPositions(); return; }
+               }
+            }
+         }
+         if(InpShorts && down && !HasOpenPosition(-1))
+         {
+            double ema=EMA(InpTFMicro, InpEMAMicro, 0);
+            double tol=PipsToPrice(atrp*InpPB_NearEMAAtr);
+            double h=iHigh(_Symbol, InpTF, 0), l=iLow(_Symbol, InpTF, 0),
+                   o=iOpen(_Symbol, InpTF, 0), c=iClose(_Symbol, InpTF, 0);
+            bool near=(MathAbs(c-ema)<=tol)||(h>=ema-tol);
+            double range=h-l; if(range>0)
+            {
+               double upperW=(h-MathMax(o,c));
+               double wickPct=(upperW/range)*100.0;
+               if(near && c<=o && wickPct>=InpPB_WickMinPct)
+               {
+                  double e=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+                  double sp=atrp*1.3; double s=e+PipsToPrice(sp);
+                  SetRiskOnce(PickRisk(true,false));
+                  double tp=(InpUseTP1_BE_Trail?0.0:(e - PipsToPrice(sp*2.0)));
+                  if(OpenPosition(-1,e,s,tp)){ ManageOpenPositions(); return; }
+               }
+            }
+         }
+      }
+   }
+
+   // HUD/Logs (шинэ бар дээр л)
+   if(InpDebugLogs && NewBar())
+   {
+      string msg=StringFormat("UP:%d DN:%d wait:%d lvl:%.5f TTL:%d  indec:%d",
+         (int)up,(int)down,(int)g_waitRetest,g_breakLevel,(g_waitRetest? iBars(_Symbol,InpTF)-g_breakBar:0),
+         (int)IsIndecisionZone());
+      Print("[V8_1] ", msg);
+      HUD("V8_1  "+msg);
+   }
+
+   ManageOpenPositions();
+}
+
+//=== Cooldown
+bool CooldownActive()
+{
+   bool useBars=(InpCooldownBars>0), useMins=(InpCooldownMinutes>0);
+   if(!useBars && !useMins) return false;
+
+   if(useBars && g_lastLossBar>=0)
+   {
+      int barsNow=iBars(_Symbol, InpTF);
+      if(barsNow - g_lastLossBar < InpCooldownBars) return true;
+   }
+   if(useMins && g_lastLossTime>0)
+   {
+      datetime now=TimeCurrent();
+      if((now-g_lastLossTime) < (InpCooldownMinutes*60)) return true;
+   }
+   return false;
+}
